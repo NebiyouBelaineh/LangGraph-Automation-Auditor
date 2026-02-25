@@ -210,3 +210,8 @@ output/
 
 # Docs personal
 docs/personal/
+docs/report/templates
+
+# Cursor plans and rules
+.cursor/plans/
+.cursor/rules/
