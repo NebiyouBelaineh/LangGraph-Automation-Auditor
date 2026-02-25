@@ -1,0 +1,34 @@
+# Version control
+.git/
+.gitignore
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Tests & dev tooling
+tests/
+.pytest_cache/
+.coverage
+
+# Local env — secrets must never enter the image
+.env
+
+# Editor / OS
+.cursor/
+.vscode/
+*.DS_Store
+
+# Docs (not needed at runtime)
+docs/
+
+# Existing outputs
+output/
+audit/
