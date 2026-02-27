@@ -8,22 +8,22 @@
 
 1. [Project Overview](#1-project-overview)
 2. [Architecture Decisions](#2-architecture-decisions)
-   - [2.1 Why Pydantic + TypedDict over Plain Dicts](#21-why-pydantic--typeddict-over-plain-dicts)
-   - [2.2 State Reducers: Preventing Parallel Overwrites](#22-state-reducers-preventing-parallel-overwrites)
-   - [2.3 AST Parsing Strategy](#23-ast-parsing-strategy)
-   - [2.4 Sandboxing Strategy for Repository Cloning](#24-sandboxing-strategy-for-repository-cloning)
-   - [2.5 PDF Ingestion: RAG-Lite Without a Vector Store](#25-pdf-ingestion-rag-lite-without-a-vector-store)
-   - [2.6 Vision Analysis: Graceful Degradation](#26-vision-analysis-graceful-degradation)
+  - [2.1 Why Pydantic + TypedDict over Plain Dicts](#21-why-pydantic--typeddict-over-plain-dicts)
+  - [2.2 State Reducers: Preventing Parallel Overwrites](#22-state-reducers-preventing-parallel-overwrites)
+  - [2.3 AST Parsing Strategy](#23-ast-parsing-strategy)
+  - [2.4 Sandboxing Strategy for Repository Cloning](#24-sandboxing-strategy-for-repository-cloning)
+  - [2.5 PDF Ingestion: RAG-Lite Without a Vector Store](#25-pdf-ingestion-rag-lite-without-a-vector-store)
+  - [2.6 Vision Analysis: Graceful Degradation](#26-vision-analysis-graceful-degradation)
 3. [Interim StateGraph Flow](#3-interim-stategraph-flow)
-   - [3.1 Node Topology](#31-node-topology)
-   - [3.2 Conditional Edge Logic](#32-conditional-edge-logic)
-   - [3.3 State Data Flow](#33-state-data-flow)
+  - [3.1 Node Topology](#31-node-topology)
+  - [3.2 Conditional Edge Logic](#32-conditional-edge-logic)
+  - [3.3 State Data Flow](#33-state-data-flow)
 4. [Rubric Dimension Coverage](#4-rubric-dimension-coverage)
 5. [Known Gaps and Plan for Final Submission](#5-known-gaps-and-plan-for-final-submission)
-   - [5.1 Judicial Layer](#51-judicial-layer)
-   - [5.2 Chief Justice Synthesis Engine](#52-chief-justice-synthesis-engine)
-   - [5.3 Dynamic Rubric Loading](#53-dynamic-rubric-loading)
-   - [5.4 Complete Graph Wiring](#54-complete-graph-wiring)
+  - [5.1 Judicial Layer](#51-judicial-layer)
+  - [5.2 Chief Justice Synthesis Engine](#52-chief-justice-synthesis-engine)
+  - [5.3 Dynamic Rubric Loading](#53-dynamic-rubric-loading)
+  - [5.4 Complete Graph Wiring](#54-complete-graph-wiring)
 6. [Planned Final Architecture](#6-planned-final-architecture)
 7. [Environment and Observability](#7-environment-and-observability)
 
@@ -127,6 +127,8 @@ classDiagram
     AuditReport "1" --> "many" CriterionResult : criteria
 ```
 
+
+
 ---
 
 ### 2.2 State Reducers: Preventing Parallel Overwrites
@@ -160,6 +162,8 @@ sequenceDiagram
     note over S: ⚠️ "doc" key is overwritten
 ```
 
+
+
 **With `operator.ior` reducer (correct merge):**
 
 ```mermaid
@@ -175,6 +179,8 @@ sequenceDiagram
     note over S: reducer merges all three dicts
     note over S: evidences = {"repo": [...], "doc": [...], "vision": [...]}
 ```
+
+
 
 ---
 
@@ -254,6 +260,8 @@ flowchart TD
     F -->|yes| H[Return CloneResult ok=True\ncloned_path=tmp_dir]
 ```
 
+
+
 **Layer 1 — URL allow-listing:**
 Only `https://` and `git@` prefixes are accepted. Any other value returns an error before any subprocess is spawned. This prevents injection strings like `; rm -rf /` embedded in a URL.
 
@@ -324,15 +332,19 @@ flowchart TD
     J -->|exception| L["Evidence(found=False,\nerror=api_error)"]
 ```
 
+
+
 The vision model receives a structured prompt requesting a JSON response with `classification`, `description`, `has_parallel_branches`, and `confidence`. The five classification labels are aligned with the rubric's `swarm_visual` dimension:
 
-| Label | Meaning |
-|---|---|
+
+| Label                 | Meaning                                       |
+| --------------------- | --------------------------------------------- |
 | `accurate_stategraph` | Shows parallel fan-out/fan-in LangGraph nodes |
-| `sequence_diagram` | UML sequence / step arrows |
-| `generic_flowchart` | Flowchart without parallelism |
-| `linear_pipeline` | Strictly sequential, no parallelism |
-| `other` | Unclassifiable |
+| `sequence_diagram`    | UML sequence / step arrows                    |
+| `generic_flowchart`   | Flowchart without parallelism                 |
+| `linear_pipeline`     | Strictly sequential, no parallelism           |
+| `other`               | Unclassifiable                                |
+
 
 ---
 
@@ -369,6 +381,8 @@ flowchart TD
     evidence_aggregator --> END
 ```
 
+
+
 ### 3.2 Conditional Edge Logic
 
 The `entry_node` validates inputs before the detective fan-out:
@@ -381,6 +395,8 @@ flowchart LR
     entry -.->|direct edge| doc_analyst
     entry -.->|direct edge| vision_inspector
 ```
+
+
 
 Note: `doc_analyst` and `vision_inspector` receive direct (non-conditional) edges from `entry` because they are independent of URL validity — the DocAnalyst and VisionInspector only require `pdf_path`. The conditional router gates only `RepoInvestigator`.
 
@@ -413,29 +429,35 @@ sequenceDiagram
     Agg-->>User: AgentState{evidences: {repo, doc, vision}}
 ```
 
+
+
 ---
 
 ## 4. Rubric Dimension Coverage
 
 The table below maps each rubric dimension to the detective node and tool function that collects it, along with the confidence heuristic applied:
 
-| Dimension | Detective | Tool Function | Confidence Heuristic |
-|---|---|---|---|
-| `git_forensic_analysis` | RepoInvestigator | `extract_git_history` | 0.85 if ≥2 phases detected in commit messages; 0.4 otherwise |
-| `state_management_rigor` | RepoInvestigator | AST scan of `src/state.py` | 0.9 if Pydantic + TypedDict + reducers all present; 0.5 otherwise |
-| `graph_orchestration` | RepoInvestigator | `analyze_graph_structure` | 0.9 if fan-out AND fan-in detected; 0.5 otherwise |
-| `safe_tool_engineering` | RepoInvestigator | `clone_repo_sandboxed` (self-audit) | 0.95 (constant — deterministic check) |
-| `theoretical_depth` | DocAnalyst | `query_pdf` × 6 rubric queries | `matched_count / total_queries` |
-| `report_accuracy` | DocAnalyst | `extract_file_paths_from_text` + path existence check | `verified_count / mentioned_count` |
-| `swarm_visual` | VisionInspector | `extract_images_from_pdf` + `analyze_diagram` | LLM-reported confidence × 0.5 if not `accurate_stategraph` |
+
+| Dimension                | Detective        | Tool Function                                         | Confidence Heuristic                                              |
+| ------------------------ | ---------------- | ----------------------------------------------------- | ----------------------------------------------------------------- |
+| `git_forensic_analysis`  | RepoInvestigator | `extract_git_history`                                 | 0.85 if ≥2 phases detected in commit messages; 0.4 otherwise      |
+| `state_management_rigor` | RepoInvestigator | AST scan of `src/state.py`                            | 0.9 if Pydantic + TypedDict + reducers all present; 0.5 otherwise |
+| `graph_orchestration`    | RepoInvestigator | `analyze_graph_structure`                             | 0.9 if fan-out AND fan-in detected; 0.5 otherwise                 |
+| `safe_tool_engineering`  | RepoInvestigator | `clone_repo_sandboxed` (self-audit)                   | 0.95 (constant — deterministic check)                             |
+| `theoretical_depth`      | DocAnalyst       | `query_pdf` × 6 rubric queries                        | `matched_count / total_queries`                                   |
+| `report_accuracy`        | DocAnalyst       | `extract_file_paths_from_text` + path existence check | `verified_count / mentioned_count`                                |
+| `swarm_visual`           | VisionInspector  | `extract_images_from_pdf` + `analyze_diagram`         | LLM-reported confidence × 0.5 if not `accurate_stategraph`        |
+
 
 **Dimensions deferred to final submission** (Judicial Layer):
 
-| Dimension | Target Detective/Judge | Notes |
-|---|---|---|
-| `structured_output_enforcement` | RepoInvestigator | Requires `src/nodes/judges.py` to exist in target repo |
-| `judicial_nuance` | RepoInvestigator | Requires distinct judge persona prompts to scan |
-| `chief_justice_synthesis` | RepoInvestigator | Requires `src/nodes/justice.py` to exist |
+
+| Dimension                       | Target Detective/Judge | Notes                                                  |
+| ------------------------------- | ---------------------- | ------------------------------------------------------ |
+| `structured_output_enforcement` | RepoInvestigator       | Requires `src/nodes/judges.py` to exist in target repo |
+| `judicial_nuance`               | RepoInvestigator       | Requires distinct judge persona prompts to scan        |
+| `chief_justice_synthesis`       | RepoInvestigator       | Requires `src/nodes/justice.py` to exist               |
+
 
 ---
 
@@ -458,11 +480,13 @@ prosecutor_chain = (
 
 The three personas receive the **same `Evidence` objects** but use **distinct, conflicting system prompts**:
 
-| Persona | Core philosophy | Scoring bias |
-|---|---|---|
-| Prosecutor | "Trust No One. Assume Vibe Coding." | Penalises gaps, security flaws, laziness |
-| Defense | "Reward Effort and Intent." | Credits struggle, iteration, deep understanding |
-| Tech Lead | "Does it actually work? Is it maintainable?" | Pragmatic; tie-breaker role |
+
+| Persona    | Core philosophy                              | Scoring bias                                    |
+| ---------- | -------------------------------------------- | ----------------------------------------------- |
+| Prosecutor | "Trust No One. Assume Vibe Coding."          | Penalises gaps, security flaws, laziness        |
+| Defense    | "Reward Effort and Intent."                  | Credits struggle, iteration, deep understanding |
+| Tech Lead  | "Does it actually work? Is it maintainable?" | Pragmatic; tie-breaker role                     |
+
 
 The judges run in **parallel fan-out** from `EvidenceAggregator`, using `operator.add` on `AgentState.opinions` so all three `JudicialOpinion` objects accumulate without overwriting each other.
 
@@ -482,6 +506,8 @@ flowchart LR
     defense -->|JudicialOpinion| opinion_merge
     techlead -->|JudicialOpinion| opinion_merge
 ```
+
+
 
 **Retry on structured output failure:**
 If `.with_structured_output()` raises a `ValidationError` or returns `None`, the node retries up to 2 times before emitting a fallback `JudicialOpinion(score=1, argument="Parse failure — structured output not returned.", cited_evidence=[])`.
@@ -514,6 +540,8 @@ flowchart TD
     J --> K
 ```
 
+
+
 **Dissent requirement:** Any criterion where `max(scores) - min(scores) > 2` must include a `dissent_summary` field in `CriterionResult` explaining which side was overruled and why.
 
 **Output:** The node serialises `AuditReport` to a Markdown file under `audit/report_onself_generated/` or `audit/report_onpeer_generated/` depending on whose repo was audited.
@@ -535,6 +563,8 @@ flowchart LR
     dispatcher -->|target_artifact == pdf_report| doc_analyst
     dispatcher -->|target_artifact == pdf_images| vision_inspector
 ```
+
+
 
 The `rubric.json` is the "Constitution" of the swarm. By separating it from agent code, rubric updates (new dimensions, adjusted weights) can be applied without redeploying the graph. Each detective receives only the `forensic_instruction` fields relevant to its `target_artifact` type.
 
@@ -581,6 +611,8 @@ flowchart TD
     report_writer["ReportWriter\n(Markdown serialiser)"] --> END([END])
 ```
 
+
+
 ---
 
 ## 6. Planned Final Architecture
@@ -620,17 +652,21 @@ stateDiagram-v2
     ReportWriter --> [*]
 ```
 
+
+
 **Key properties of the full system:**
 
-| Property | Implementation |
-|---|---|
-| Two parallel fan-out/fan-in layers | Detectives + Judges both run in parallel branches |
-| Type-safe state throughout | Pydantic `BaseModel` for all value objects |
-| No parallel overwrite | `operator.ior` (dicts) and `operator.add` (lists) reducers |
-| Deterministic synthesis | Hardcoded Python rules in `ChiefJusticeNode`, not LLM prompts |
-| Graceful failure | Every node catches exceptions; emits `found=False` Evidence |
-| Structured output enforcement | `.with_structured_output(JudicialOpinion)` on all judge chains |
-| Observable | LangSmith tracing via `LANGCHAIN_TRACING_V2=true` |
+
+| Property                           | Implementation                                                 |
+| ---------------------------------- | -------------------------------------------------------------- |
+| Two parallel fan-out/fan-in layers | Detectives + Judges both run in parallel branches              |
+| Type-safe state throughout         | Pydantic `BaseModel` for all value objects                     |
+| No parallel overwrite              | `operator.ior` (dicts) and `operator.add` (lists) reducers     |
+| Deterministic synthesis            | Hardcoded Python rules in `ChiefJusticeNode`, not LLM prompts  |
+| Graceful failure                   | Every node catches exceptions; emits `found=False` Evidence    |
+| Structured output enforcement      | `.with_structured_output(JudicialOpinion)` on all judge chains |
+| Observable                         | LangSmith tracing via `LANGCHAIN_TRACING_V2=true`              |
+
 
 ---
 
@@ -638,12 +674,14 @@ stateDiagram-v2
 
 ### Environment Variables
 
-| Variable | Purpose | Required |
-|---|---|---|
-| `LANGCHAIN_TRACING_V2=true` | Enables LangSmith distributed tracing | No |
-| `LANGCHAIN_API_KEY` | LangSmith authentication | No |
-| `ANTHROPIC_API_KEY` | Claude 3.5 Haiku for VisionInspector diagram analysis | For vision |
-| `OPENAI_API_KEY` | GPT-4o-mini fallback for VisionInspector | Alternative |
+
+| Variable                    | Purpose                                               | Required    |
+| --------------------------- | ----------------------------------------------------- | ----------- |
+| `LANGCHAIN_TRACING_V2=true` | Enables LangSmith distributed tracing                 | No          |
+| `LANGCHAIN_API_KEY`         | LangSmith authentication                              | No          |
+| `ANTHROPIC_API_KEY`         | Claude 3.5 Haiku for VisionInspector diagram analysis | For vision  |
+| `OPENAI_API_KEY`            | GPT-4o-mini fallback for VisionInspector              | Alternative |
+
 
 The `RepoInvestigator` and `DocAnalyst` operate entirely without LLM calls — they are deterministic forensic tools. Only `VisionInspector` requires an API key for diagram classification, and it degrades gracefully to `found=False` when no key is present.
 
@@ -656,6 +694,8 @@ flowchart LR
     langgraph_invoke -->|stdout| terminal["CLI Summary\n(evidence table)"]
     langgraph_invoke -->|JSON| output["output/evidence.json\n(full Evidence objects)"]
 ```
+
+
 
 Each node execution is automatically captured as a LangSmith span, showing the input state, output state delta, and latency. This is essential for debugging the parallel fan-out — without it, determining which detective emitted which evidence (or failed silently) requires inspecting raw state diffs.
 
