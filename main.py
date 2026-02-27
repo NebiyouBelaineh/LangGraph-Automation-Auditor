@@ -2,6 +2,9 @@
 
 Usage:
     uv run python main.py --repo-url https://github.com/... --pdf-path reports/interim_report.pdf
+
+    Resume a crashed run (reuses checkpoint; skips completed nodes):
+    uv run python main.py --repo-url ... --pdf-path ... --thread-id audit-20260227-165030
 """
 
 from __future__ import annotations
@@ -10,11 +13,25 @@ import argparse
 import json
 import os
 import sys
+import uuid
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+_RUBRIC_PATH = Path(__file__).parent / "docs" / "rubric.json"
+
+
+def _load_rubric() -> list[dict]:
+    """Load rubric dimensions from rubric.json; returns empty list if file is missing."""
+    if not _RUBRIC_PATH.exists():
+        print(f"[auditor] Warning: rubric not found at {_RUBRIC_PATH}", file=sys.stderr)
+        return []
+    with _RUBRIC_PATH.open() as fh:
+        data = json.load(fh)
+    return data.get("dimensions", [])
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -34,6 +51,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--output",
         default="output/evidence.json",
         help="Where to write the evidence JSON (default: output/evidence.json)",
+    )
+    parser.add_argument(
+        "--thread-id",
+        default=None,
+        metavar="ID",
+        help=(
+            "Resume a previous run using its checkpoint thread ID. "
+            "Completed nodes are skipped; only failed/unstarted nodes re-run. "
+            "The thread ID is printed at the start of every run."
+        ),
     )
     parser.add_argument(
         "--help-docker",
@@ -82,12 +109,35 @@ def main() -> None:
         print(f"[error] PDF not found: {pdf_path}", file=sys.stderr)
         sys.exit(1)
 
-    from src.graph import graph
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    from src.graph import make_graph
+    from src.utils.spend_tracker import TRACKER
+
+    rubric_dimensions = _load_rubric()
+    print(f"[auditor] Loaded {len(rubric_dimensions)} rubric dimensions from {_RUBRIC_PATH.name}")
+
+    # Thread ID for checkpointing — every run is identified so state can be resumed after a crash.
+    thread_id: str = args.thread_id or (
+        f"audit-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    )
+    resuming = args.thread_id is not None
+    print(f"[auditor] Thread ID : {thread_id}")
+    if resuming:
+        print("[auditor] Mode      : RESUME  (completed nodes will be skipped)")
+    else:
+        print("[auditor] Mode      : NEW RUN")
+    print(f"[auditor] Tip       : re-run with --thread-id {thread_id} if the process crashes")
+
+    base = Path(args.output)
+    base.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_db = base.parent / "checkpoints.db"
+    print(f"[auditor] Checkpoint: {checkpoint_db}")
 
     initial_state = {
         "repo_url": args.repo_url,
         "pdf_path": str(pdf_path),
-        "rubric_dimensions": [],
+        "rubric_dimensions": rubric_dimensions,
         "evidences": {},
         "opinions": [],
         "final_report": None,
@@ -96,7 +146,11 @@ def main() -> None:
     print(f"[auditor] Running graph for repo: {args.repo_url}")
     print(f"[auditor] PDF: {pdf_path}")
 
-    result = graph.invoke(initial_state)
+    run_config = {"configurable": {"thread_id": thread_id}}
+
+    with SqliteSaver.from_conn_string(str(checkpoint_db)) as checkpointer:
+        graph = make_graph(checkpointer=checkpointer)
+        result = graph.invoke(initial_state, config=run_config)
 
     evidences = result.get("evidences", {})
 
@@ -111,16 +165,26 @@ def main() -> None:
                 short = ev.rationale[:120].replace("\n", " ")
                 print(f"      {short}")
 
-    # Save JSON output
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"\n{TRACKER.report()}")
+
+    # Save JSON output — always write a timestamped file; also update the
+    # canonical path (--output) so the caller always has a fixed reference.
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamped_path = base.parent / f"{base.stem}_{timestamp}{base.suffix}"
 
     serialisable = {
-        bucket: [ev.model_dump() for ev in items]
-        for bucket, items in evidences.items()
+        "thread_id": thread_id,
+        "evidences": {
+            bucket: [ev.model_dump() for ev in items]
+            for bucket, items in evidences.items()
+        },
+        "spend": TRACKER.summary(),
     }
-    output_path.write_text(json.dumps(serialisable, indent=2))
-    print(f"\n[auditor] Evidence written to {output_path}")
+    payload = json.dumps(serialisable, indent=2)
+    timestamped_path.write_text(payload)
+    base.write_text(payload)
+    print(f"[auditor] Evidence written to {timestamped_path}")
+    print(f"[auditor] Latest snapshot: {base}")
 
 
 if __name__ == "__main__":

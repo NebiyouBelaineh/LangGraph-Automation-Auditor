@@ -7,6 +7,13 @@ Topology:
     evidence_aggregator → END
 
 Conditional edges: entry_node routes to END early when inputs are missing/invalid.
+
+Checkpointing
+-------------
+Use make_graph(checkpointer) to compile with a SqliteSaver (or any
+BaseCheckpointSaver).  LangGraph will snapshot AgentState after every node
+completes.  A crashed run can be resumed by re-invoking with the same
+thread_id in config["configurable"].
 """
 
 from __future__ import annotations
@@ -56,13 +63,35 @@ _REQUIRED_DIMENSIONS = {
     "vision": ["swarm_visual"],
 }
 
+_ARTIFACT_TO_BUCKET: dict[str, str] = {
+    "github_repo": "repo",
+    "pdf_report": "doc",
+    "pdf_images": "vision",
+}
+
+
+def _required_from_rubric(rubric_dimensions: list[dict]) -> dict[str, list[str]]:
+    """Derive the bucket→dimension-id map from rubric dimensions in state."""
+    required: dict[str, list[str]] = {}
+    for dim in rubric_dimensions:
+        bucket = _ARTIFACT_TO_BUCKET.get(dim.get("target_artifact", ""))
+        if bucket:
+            required.setdefault(bucket, []).append(dim["id"])
+    return required
+
 
 def evidence_aggregator_node(state: AgentState) -> dict[str, Any]:
     """Validate all dimension keys are present; backfill missing with found=False Evidence.
+
+    Uses rubric_dimensions from state when available so the backfill list stays in
+    sync with the rubric without requiring code changes.
     """
     evidences: dict[str, list[Evidence]] = dict(state.get("evidences", {}))
+    rubric_dimensions: list[dict] = state.get("rubric_dimensions", [])
 
-    for bucket, dimensions in _REQUIRED_DIMENSIONS.items():
+    required = _required_from_rubric(rubric_dimensions) if rubric_dimensions else _REQUIRED_DIMENSIONS
+
+    for bucket, dimensions in required.items():
         bucket_evidences = {e.goal: e for e in evidences.get(bucket, [])}
         for dim in dimensions:
             if dim not in bucket_evidences:
@@ -96,11 +125,14 @@ def _input_router(state: AgentState) -> Literal["detectives", "abort"]:
 
 
 def _abort_node(state: AgentState) -> dict[str, Any]:
-    """Emit found=False for all dimensions when inputs are invalid.
     """
-    all_dimensions = [dim for dims in _REQUIRED_DIMENSIONS.values() for dim in dims]
+    Emit found=False for all dimensions when inputs are invalid
+    """
+    rubric_dimensions: list[dict] = state.get("rubric_dimensions", [])
+    required = _required_from_rubric(rubric_dimensions) if rubric_dimensions else _REQUIRED_DIMENSIONS
+
     evidences: dict[str, list[Evidence]] = {}
-    for bucket, dimensions in _REQUIRED_DIMENSIONS.items():
+    for bucket, dimensions in required.items():
         evidences[bucket] = [
             Evidence(
                 goal=dim,
@@ -150,4 +182,17 @@ builder.add_edge("vision_inspector", "evidence_aggregator")
 builder.add_edge("abort", END)
 builder.add_edge("evidence_aggregator", END)
 
-graph = builder.compile()
+
+def make_graph(checkpointer=None):
+    """Compile the graph, optionally with a checkpoint saver.
+
+    Pass a SqliteSaver (or any BaseCheckpointSaver) to enable automatic
+    state snapshotting after every node.  Without a checkpointer the graph
+    behaves identically to before — this keeps the default import usable
+    in tests and scripts that don't need fault-tolerance.
+    """
+    return builder.compile(checkpointer=checkpointer)
+
+
+# Default (no checkpointing) — used by tests and direct imports.
+graph = make_graph()
