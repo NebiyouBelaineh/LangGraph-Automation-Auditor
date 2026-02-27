@@ -8,6 +8,7 @@ dependencies = [
     "langchain-core>=1.2.15",
     "langchain-openai>=0.3.0",
     "langgraph>=1.0.9",
+    "langgraph-checkpoint-sqlite>=3.0.3",
     "pydantic>=2.12.5",
     "pymupdf>=1.25.0",
     "python-dotenv>=1.2.1",

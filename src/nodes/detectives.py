@@ -1,331 +1,514 @@
 """Detective node functions for the Automaton Auditor graph.
 
-Each node reads from AgentState, calls forensic tools, and writes
-structured Evidence into state["evidences"] via the operator.ior reducer.
+Each node is an LLM tool-calling agent that:
+1. Reads its assigned rubric dimensions from AgentState.rubric_dimensions.
+2. Builds a system prompt from each dimension's forensic_instruction,
+   success_pattern, and failure_pattern.
+3. Autonomously calls forensic tools until it has enough evidence.
+4. Emits a structured Evidence object per dimension via with_structured_output.
+
 Nodes never raise — failures produce Evidence(found=False, ...) entries.
 """
 
 from __future__ import annotations
 
-import ast
+import json
 from pathlib import Path
 from typing import Any
 
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from src.state import AgentState, Evidence
-from src.tools.doc_tools import (
-    RUBRIC_QUERIES,
-    extract_file_paths_from_text,
-    ingest_pdf,
-    query_pdf,
-)
+from src.utils.audit_logger import LOGGER
+from src.utils.spend_tracker import TRACKER
+from src.tools.doc_tools import extract_and_check_file_paths, query_pdf_for_term
 from src.tools.repo_tools import (
-    analyze_graph_structure,
+    clone_repo,
     clone_repo_sandboxed,
-    extract_git_history,
+    list_repo_files,
+    read_git_history,
+    run_graph_structure_analysis,
+    scan_file_for_patterns,
 )
-from src.tools.vision_tools import analyze_diagram, extract_images_from_pdf
+from src.tools.vision_tools import extract_and_analyze_diagrams
 
 
 # ---------------------------------------------------------------------------
-# helpers
+# System prompt builder
 # ---------------------------------------------------------------------------
 
+_DETECTIVE_RULES = """\
+You are a forensic investigator conducting a software audit.
+Your job is to collect factual evidence for each assigned rubric dimension.
 
-def _fail(goal: str, rationale: str) -> Evidence:
-    return Evidence(
-        goal=goal,
+RULES:
+- Always call tools to gather evidence before drawing any conclusions.
+- Do not assume file contents, code structure, or PDF content — verify with tools.
+- If a tool returns an error, set found=false for the affected dimension.
+- For each dimension you must emit exactly one Evidence object.
+- Your rationale must explicitly reference the success or failure pattern from the rubric.
+- Confidence (0.0–1.0) must reflect how closely the evidence matches the success pattern:
+    1.0 = fully matches success pattern
+    0.0 = fully matches failure pattern
+    0.5 = partial or ambiguous match
+
+TOOL CALL EFFICIENCY (important):
+- Issue ALL independent tool calls simultaneously in a single response turn.
+  Do NOT call one tool and wait for its result before calling other tools that
+  do not depend on it. For example: if the forensic instruction asks you to
+  search for four terms, issue all four query_pdf_for_term calls at once.
+- Only issue tool calls sequentially when the second call strictly depends on
+  the result of the first (e.g. list_repo_files to discover a filename, then
+  scan_file_for_patterns on that specific file).
+- This applies regardless of how many checks the rubric requires — always
+  batch everything that can run independently into a single turn.
+"""
+
+
+def _build_system_prompt(dimensions: list[dict]) -> str:
+    """Construct a system prompt embedding all forensic instructions for assigned dimensions."""
+    parts = [_DETECTIVE_RULES, "\n\nYOUR ASSIGNED DIMENSIONS:\n"]
+    for dim in dimensions:
+        parts.append(
+            f"\n--- Dimension: {dim['id']} ---\n"
+            f"Name: {dim['name']}\n"
+            f"Forensic Instruction:\n  {dim['forensic_instruction']}\n"
+            f"Success Pattern:\n  {dim['success_pattern']}\n"
+            f"Failure Pattern:\n  {dim['failure_pattern']}\n"
+        )
+    return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Core agent loop
+# ---------------------------------------------------------------------------
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+_MODEL = os.environ.get("DETECTIVE_MODEL", "claude-haiku-4-5-20251001")
+_MAX_ITERATIONS = int(os.environ.get("DETECTIVE_MAX_ITERATIONS", 8))
+# Stop early after this many consecutive all-fail rounds (every tool returned
+# an error or "file not found") to avoid burning tokens on non-existent files.
+_MAX_EMPTY_ROUNDS = 2
+
+
+def _is_not_found(result: Any) -> bool:
+    """Return True when a tool result carries no useful information.
+
+    Matches the common "file not found" / error patterns returned by repo_tools
+    and doc_tools so the loop can detect when the LLM is spinning its wheels.
+    """
+    if not isinstance(result, dict):
+        return False
+    if result.get("exists") is False:
+        return True
+    if result.get("ok") is False:
+        return True
+    return False
+
+
+def _run_detective_agent(
+    dimension: dict,
+    user_message: str,
+    tools: list,
+    node_name: str,
+) -> Evidence:
+    """Run a tool-calling LLM loop for a single rubric dimension and emit one Evidence.
+
+    Each call handles exactly one dimension so the system prompt stays small,
+    failures are isolated per dimension, and spend is tracked per dimension.
+
+    Two cost-control mechanisms are active:
+    - missing_paths: if scan_file_for_patterns already confirmed a file is absent,
+      subsequent calls for the same path are short-circuited without an LLM turn.
+    - consecutive_empty: if every tool in a round returns not-found/error for
+      _MAX_EMPTY_ROUNDS rounds in a row, the loop exits and proceeds to emission.
+    """
+    TRACKER.set_node(f"{node_name}:{dimension['id']}")
+    LOGGER.set_node(node_name, [dimension])
+
+    llm = ChatAnthropic(model=_MODEL, temperature=0)
+    llm_with_tools = llm.bind_tools(tools)
+    tool_map = {t.name: t for t in tools}
+
+    messages: list = [
+        SystemMessage(content=_build_system_prompt([dimension])),
+        HumanMessage(content=user_message),
+    ]
+
+    _callbacks = {"callbacks": [TRACKER, LOGGER]}
+
+    # Paths already confirmed absent — short-circuit repeated scans of the same file.
+    _missing_paths: set[str] = set()
+    # Counts consecutive rounds where every tool call was non-productive.
+    _consecutive_empty = 0
+
+    # Tool-calling loop
+    for _ in range(_MAX_ITERATIONS):
+        response = llm_with_tools.invoke(messages, config=_callbacks)
+        messages.append(response)
+
+        if not response.tool_calls:
+            break
+
+        round_results: list[Any] = []
+
+        for tc in response.tool_calls:
+            # ── Missing-file short-circuit ────────────────────────────────
+            # If the LLM asks to scan a file already confirmed absent, reply
+            # immediately without consuming another LLM call or tool invocation.
+            if tc["name"] == "scan_file_for_patterns":
+                rel_path: str = tc["args"].get("relative_path", "")
+                if rel_path and rel_path in _missing_paths:
+                    result: Any = {
+                        "ok": False,
+                        "exists": False,
+                        "error": (
+                            f"File not found: {rel_path} — already confirmed missing, "
+                            "skipping re-check."
+                        ),
+                    }
+                    messages.append(
+                        ToolMessage(
+                            content=json.dumps(result, default=str),
+                            tool_call_id=tc["id"],
+                        )
+                    )
+                    round_results.append(result)
+                    continue
+
+            # ── Normal tool invocation ────────────────────────────────────
+            tool_fn = tool_map.get(tc["name"])
+            if tool_fn is None:
+                result = {"error": f"unknown tool: {tc['name']}"}
+            else:
+                try:
+                    result = tool_fn.invoke(tc["args"], config=_callbacks)
+                except Exception as exc:
+                    result = {"error": str(exc)}
+
+            # Record confirmed-missing paths for future short-circuiting.
+            if tc["name"] == "scan_file_for_patterns" and isinstance(result, dict):
+                if not result.get("exists", True) or not result.get("ok", True):
+                    rp = tc["args"].get("relative_path", "")
+                    if rp:
+                        _missing_paths.add(rp)
+
+            messages.append(
+                ToolMessage(
+                    content=json.dumps(result, default=str),
+                    tool_call_id=tc["id"],
+                )
+            )
+            round_results.append(result)
+
+        # ── Early-exit on consecutive empty rounds ────────────────────────
+        # If every tool call in this round was non-productive, increment the
+        # counter.  After _MAX_EMPTY_ROUNDS consecutive such rounds, inject a
+        # stop hint and break — the target files simply don't exist.
+        if round_results and all(_is_not_found(r) for r in round_results):
+            _consecutive_empty += 1
+            if _consecutive_empty >= _MAX_EMPTY_ROUNDS:
+                messages.append(
+                    HumanMessage(
+                        content=(
+                            "All recent tool calls returned 'file not found' or errors. "
+                            "The files you are looking for do not exist in this repository. "
+                            "You now have sufficient information — proceed to emit your evidence."
+                        )
+                    )
+                )
+                break
+        else:
+            _consecutive_empty = 0
+
+    # Structured evidence emission — use a fresh LLM instance to avoid conflict
+    # between the tool-calling schema and the structured-output schema.
+    _EMISSION_PROMPT = (
+        f"Based on all evidence gathered, produce one Evidence object "
+        f"for dimension '{dimension['id']}'. "
+        "Return a JSON object with EXACTLY these fields:\n"
+        "  goal       : string — the dimension id\n"
+        "  found      : boolean — true if the success pattern is satisfied\n"
+        "  location   : string — file path, section, or 'unknown'\n"
+        "  rationale  : string — your reasoning citing the success or failure pattern\n"
+        "  confidence : float  — a number between 0.0 and 1.0 (NOT inside rationale)\n"
+        "IMPORTANT: 'confidence' MUST be a separate numeric field, never embedded in rationale."
+    )
+
+    messages.append(HumanMessage(content=_EMISSION_PROMPT))
+
+    evidence_llm = ChatAnthropic(model=_MODEL, temperature=0).with_structured_output(Evidence)
+    last_exc: Exception | None = None
+
+    for attempt in range(3):
+        try:
+            retry_msgs = list(messages)
+            if attempt > 0:
+                retry_msgs.append(
+                    HumanMessage(
+                        content=(
+                            f"Attempt {attempt} failed schema validation: {last_exc}. "
+                            "Ensure 'confidence' is a standalone float field "
+                            "(e.g. 0.75) — do NOT embed it inside the 'rationale' string."
+                        )
+                    )
+                )
+            ev = evidence_llm.invoke(retry_msgs, config=_callbacks)
+            LOGGER.log_evidence([ev])
+            return ev
+        except Exception as exc:
+            last_exc = exc
+            continue
+
+    fallback = Evidence(
+        goal=dimension["id"],
         found=False,
         location="unknown",
-        rationale=rationale,
+        rationale=f"Evidence emission failed after 3 attempts: {last_exc}",
         confidence=0.0,
     )
-
-
-def _ok(goal: str, content: str, location: str, rationale: str, confidence: float) -> Evidence:
-    return Evidence(
-        goal=goal,
-        found=True,
-        content=content,
-        location=location,
-        rationale=rationale,
-        confidence=min(max(confidence, 0.0), 1.0),
-    )
+    LOGGER.log_evidence([fallback])
+    return fallback
 
 
 # ---------------------------------------------------------------------------
 # RepoInvestigator
 # ---------------------------------------------------------------------------
 
+_REPO_TOOLS = [
+    clone_repo,
+    read_git_history,
+    run_graph_structure_analysis,
+    scan_file_for_patterns,
+    list_repo_files,
+]
+
 
 def repo_investigator_node(state: AgentState) -> dict[str, Any]:
-    """Clone the repo, analyse git history and graph AST structure."""
-    repo_url: str = state.get("repo_url", "")
-    evidences: dict[str, list[Evidence]] = {}
+    """LLM agent that investigates github_repo rubric dimensions using forensic tools.
 
-    # --- Clone ---
+    Clones the repository once upfront, then runs one LLM agent call per dimension
+    so each prompt stays small and a single dimension failure doesn't block the rest.
+    """
+    repo_url: str = state.get("repo_url", "")
+    all_dimensions: list[dict] = state.get("rubric_dimensions", [])
+    dimensions = [d for d in all_dimensions if d.get("target_artifact") == "github_repo"]
+
+    if not dimensions:
+        return {"evidences": {"repo": []}}
+
+    if not repo_url:
+        return {
+            "evidences": {
+                "repo": [
+                    Evidence(
+                        goal=d["id"],
+                        found=False,
+                        location="unknown",
+                        rationale="No repo_url provided in state.",
+                        confidence=0.0,
+                    )
+                    for d in dimensions
+                ]
+            }
+        }
+
+    # Clone once upfront — all dimension agents reuse the same cloned_path.
     clone = clone_repo_sandboxed(repo_url)
     if not clone.ok:
-        rationale = f"Clone failed: {clone.error} — {clone.details}"
-        evidences["repo"] = [
-            _fail("git_forensic_analysis", rationale),
-            _fail("state_management_rigor", rationale),
-            _fail("graph_orchestration", rationale),
-            _fail("safe_tool_engineering", rationale),
-        ]
-        return {"evidences": evidences}
+        reason = f"Clone failed: {clone.error} — {clone.details}"
+        return {
+            "evidences": {
+                "repo": [
+                    Evidence(
+                        goal=d["id"],
+                        found=False,
+                        location="unknown",
+                        rationale=reason,
+                        confidence=0.0,
+                    )
+                    for d in dimensions
+                ]
+            }
+        }
 
-    repo_path = Path(clone.cloned_path)
+    cloned_path = clone.cloned_path
+    evidences: list[Evidence] = []
 
-    # --- Git history ---
-    git_result = extract_git_history(repo_path)
-    if git_result.ok:
-        evidences.setdefault("repo", []).append(
-            _ok(
-                "git_forensic_analysis",
-                content=git_result.progression_summary or "",
-                location=f"{repo_url} (git log)",
-                rationale=(
-                    f"{git_result.commit_count} commits found. "
-                    f"Progression detected: {git_result.progression_detected}. "
-                    f"{git_result.progression_summary}"
-                ),
-                confidence=0.85 if git_result.progression_detected else 0.4,
-            )
+    _repo_tool_names = ", ".join(t.name for t in _REPO_TOOLS)
+
+    for dim in dimensions:
+        user_message = (
+            f"Audit dimension '{dim['id']}' for repository: {repo_url}\n"
+            f"The repository is already cloned at: {cloned_path}\n"
+            "Use this cloned_path with the analysis tools. Do NOT call clone_repo again.\n"
+            f"You have access to ONLY these tools: {_repo_tool_names}\n"
+            "Do NOT attempt to call any tool not listed above."
         )
-    else:
-        evidences.setdefault("repo", []).append(
-            _fail("git_forensic_analysis", f"git log failed: {git_result.error}")
-        )
-
-    # --- State management rigor (scan src/state.py for BaseModel/TypedDict) ---
-    state_file = repo_path / "src" / "state.py"
-    if state_file.exists():
         try:
-            source = state_file.read_text(errors="replace")
-            tree = ast.parse(source)
-            class_names = [n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
-            uses_pydantic = "BaseModel" in source
-            uses_typeddict = "TypedDict" in source
-            uses_reducer = "operator" in source and ("ior" in source or "add" in source)
-
-            evidences.setdefault("repo", []).append(
-                _ok(
-                    "state_management_rigor",
-                    content=f"Classes: {', '.join(class_names)}",
-                    location=str(state_file.relative_to(repo_path)),
-                    rationale=(
-                        f"Pydantic BaseModel: {uses_pydantic}, TypedDict: {uses_typeddict}, "
-                        f"Reducers (operator.ior/add): {uses_reducer}. "
-                        f"Found classes: {class_names}."
-                    ),
-                    confidence=(0.9 if (uses_pydantic and uses_typeddict and uses_reducer) else 0.5),
-                )
+            ev = _run_detective_agent(dim, user_message, _REPO_TOOLS, "repo_investigator")
+        except Exception as exc:
+            ev = Evidence(
+                goal=dim["id"],
+                found=False,
+                location="unknown",
+                rationale=f"Agent run failed: {exc}",
+                confidence=0.0,
             )
-        except SyntaxError as exc:
-            evidences.setdefault("repo", []).append(
-                _fail("state_management_rigor", f"AST parse error on state.py: {exc}")
-            )
-    else:
-        evidences.setdefault("repo", []).append(
-            _fail("state_management_rigor", "src/state.py not found in cloned repo")
-        )
+        evidences.append(ev)
 
-    # --- Graph orchestration (fan-out/fan-in AST scan) ---
-    graph_result = analyze_graph_structure(repo_path)
-    if graph_result.ok:
-        evidences.setdefault("repo", []).append(
-            _ok(
-                "graph_orchestration",
-                content=(
-                    f"nodes={graph_result.nodes}, "
-                    f"edges={graph_result.edges}, "
-                    f"conditional_edges={graph_result.conditional_edges_count}"
-                ),
-                location=graph_result.source_file or "src/graph.py",
-                rationale=(
-                    f"Detected {len(graph_result.nodes)} nodes, {len(graph_result.edges)} edges. "
-                    f"Fan-out: {graph_result.has_parallel_branches}, "
-                    f"Fan-in: {graph_result.has_fan_in}, "
-                    f"Conditional edges: {graph_result.conditional_edges_count}."
-                ),
-                confidence=(
-                    0.9
-                    if (graph_result.has_parallel_branches and graph_result.has_fan_in)
-                    else 0.5
-                ),
-            )
-        )
-    else:
-        evidences.setdefault("repo", []).append(
-            _fail("graph_orchestration", f"Graph analysis failed: {graph_result.error}")
-        )
-
-    # --- Safe tool engineering (sandboxed clone introspection) ---
-    # We audit ourselves: the clone used tempfile + subprocess, not os.system
-    evidences.setdefault("repo", []).append(
-        _ok(
-            "safe_tool_engineering",
-            content="clone_repo_sandboxed uses tempfile.mkdtemp + subprocess.run, no os.system",
-            location="src/tools/repo_tools.py",
-            rationale=(
-                "URL validated against https:// or git@ prefix. "
-                "Clone path is an OS-managed temp dir. "
-                "subprocess.run used with explicit arg list (no shell=True). "
-                "stdout/stderr captured; return code checked."
-            ),
-            confidence=0.95,
-        )
-    )
-
-    return {"evidences": evidences}
+    return {"evidences": {"repo": evidences}}
 
 
 # ---------------------------------------------------------------------------
 # DocAnalyst
 # ---------------------------------------------------------------------------
 
+_DOC_TOOLS = [query_pdf_for_term, extract_and_check_file_paths]
+
 
 def doc_analyst_node(state: AgentState) -> dict[str, Any]:
-    """Ingest the submitted PDF and query it for rubric-relevant content."""
+    """LLM agent that investigates pdf_report rubric dimensions by querying PDF content.
+
+    Runs one LLM agent call per dimension so each prompt stays small and
+    a single dimension failure doesn't block the rest.
+    """
     pdf_path: str = state.get("pdf_path", "")
-    evidences: dict[str, list[Evidence]] = {}
+    all_dimensions: list[dict] = state.get("rubric_dimensions", [])
+    dimensions = [d for d in all_dimensions if d.get("target_artifact") == "pdf_report"]
 
-    ingest = ingest_pdf(pdf_path)
-    if not ingest.ok:
-        reason = f"PDF ingest failed: {ingest.error}"
-        evidences["doc"] = [
-            _fail("theoretical_depth", reason),
-            _fail("report_accuracy", reason),
-        ]
-        return {"evidences": evidences}
+    if not dimensions:
+        return {"evidences": {"doc": []}}
 
-    chunks = ingest.chunks
+    if not pdf_path or not Path(pdf_path).exists():
+        return {
+            "evidences": {
+                "doc": [
+                    Evidence(
+                        goal=d["id"],
+                        found=False,
+                        location="unknown",
+                        rationale="PDF path not found or not provided.",
+                        confidence=0.0,
+                    )
+                    for d in dimensions
+                ]
+            }
+        }
 
-    # --- Theoretical depth: run each rubric query ---
-    depth_findings: list[str] = []
-    for query in RUBRIC_QUERIES:
-        result = query_pdf(chunks, query, top_k=3)
-        if result.ok and result.matches:
-            best = result.matches[0]
-            depth_findings.append(
-                f'"{query}" found (score={best.score}, p{best.page_range[0]})'
+    evidences: list[Evidence] = []
+
+    _doc_tool_names = ", ".join(t.name for t in _DOC_TOOLS)
+
+    for dim in dimensions:
+        user_message = (
+            f"Audit dimension '{dim['id']}' using the PDF report: {pdf_path}\n"
+            f"You have access to ONLY these tools: {_doc_tool_names}\n"
+            "Use query_pdf_for_term to search for relevant terms and concepts. "
+            "Use extract_and_check_file_paths to verify any file path claims. "
+            "Do NOT attempt to call any tool not listed above."
+        )
+        try:
+            ev = _run_detective_agent(dim, user_message, _DOC_TOOLS, "doc_analyst")
+        except Exception as exc:
+            ev = Evidence(
+                goal=dim["id"],
+                found=False,
+                location="unknown",
+                rationale=f"Agent run failed: {exc}",
+                confidence=0.0,
             )
-        else:
-            depth_findings.append(f'"{query}" not found')
+        evidences.append(ev)
 
-    all_found = sum(1 for f in depth_findings if "found (" in f)
-    theoretical_confidence = min(0.95, all_found / max(len(RUBRIC_QUERIES), 1))
-
-    evidences.setdefault("doc", []).append(
-        _ok(
-            "theoretical_depth",
-            content="; ".join(depth_findings),
-            location=str(pdf_path),
-            rationale=(
-                f"{all_found}/{len(RUBRIC_QUERIES)} rubric concepts mentioned in PDF. "
-                + "; ".join(depth_findings)
-            ),
-            confidence=theoretical_confidence,
-        )
-    )
-
-    # --- Report accuracy: cross-reference mentioned file paths ---
-    mentioned_paths = extract_file_paths_from_text(chunks)
-
-    # Check which paths actually exist (relative to cwd or cloned repo)
-    existing_paths: list[str] = []
-    hallucinated_paths: list[str] = []
-    for mp in mentioned_paths:
-        if Path(mp).exists():
-            existing_paths.append(mp)
-        else:
-            hallucinated_paths.append(mp)
-
-    accuracy_confidence = (
-        len(existing_paths) / max(len(mentioned_paths), 1) if mentioned_paths else 0.5
-    )
-
-    evidences.setdefault("doc", []).append(
-        _ok(
-            "report_accuracy",
-            content=(
-                f"Verified: {existing_paths}; "
-                f"Hallucinated: {hallucinated_paths}"
-            ),
-            location=str(pdf_path),
-            rationale=(
-                f"{len(mentioned_paths)} file paths mentioned in PDF. "
-                f"{len(existing_paths)} verified, {len(hallucinated_paths)} not found on disk."
-            ),
-            confidence=accuracy_confidence,
-        )
-        if mentioned_paths
-        else _ok(
-            "report_accuracy",
-            content="No file paths detected in PDF text.",
-            location=str(pdf_path),
-            rationale="No src/ paths were detected in the PDF text.",
-            confidence=0.3,
-        )
-    )
-
-    return {"evidences": evidences}
+    return {"evidences": {"doc": evidences}}
 
 
 # ---------------------------------------------------------------------------
 # VisionInspector
 # ---------------------------------------------------------------------------
 
+_VISION_TOOLS = [extract_and_analyze_diagrams]
+
+
+def _vision_enabled() -> bool:
+    """Read VISION_ENABLED at call time so .env changes are always respected."""
+    return os.getenv("VISION_ENABLED", "true").lower() not in ("false", "0", "no")
+
 
 def vision_inspector_node(state: AgentState) -> dict[str, Any]:
-    """Extract diagrams from the PDF and classify them with a vision LLM."""
+    """LLM agent that investigates pdf_images rubric dimensions by analyzing diagrams.
+
+    Filters dimensions with target_artifact='pdf_images' from state, calls the
+    diagram extraction and classification tool, then emits structured Evidence.
+    Skipped entirely (no LLM or tool calls) when VISION_ENABLED=false.
+    """
+    # Guard first — no tracker, logger, or LLM calls when disabled.
+    if not _vision_enabled():
+        all_dimensions: list[dict] = state.get("rubric_dimensions", [])
+        dimensions = [d for d in all_dimensions if d.get("target_artifact") == "pdf_images"]
+        print("[auditor] VisionInspector disabled (VISION_ENABLED=false) — skipping.")
+        return {
+            "evidences": {
+                "vision": [
+                    Evidence(
+                        goal=d["id"],
+                        found=False,
+                        location="unknown",
+                        rationale="VisionInspector disabled via VISION_ENABLED=false.",
+                        confidence=0.0,
+                    )
+                    for d in dimensions
+                ]
+            }
+        }
+
     pdf_path: str = state.get("pdf_path", "")
-    evidences: dict[str, list[Evidence]] = {}
+    all_dimensions = state.get("rubric_dimensions", [])
+    dimensions = [d for d in all_dimensions if d.get("target_artifact") == "pdf_images"]
 
-    images = extract_images_from_pdf(pdf_path)
+    if not dimensions:
+        return {"evidences": {"vision": []}}
 
-    if not images:
-        evidences["vision"] = [
-            _fail(
-                "swarm_visual",
-                "No images found in PDF or PDF could not be opened.",
-            )
-        ]
-        return {"evidences": evidences}
+    if not pdf_path or not Path(pdf_path).exists():
+        return {
+            "evidences": {
+                "vision": [
+                    Evidence(
+                        goal=d["id"],
+                        found=False,
+                        location="unknown",
+                        rationale="PDF path not found or not provided.",
+                        confidence=0.0,
+                    )
+                    for d in dimensions
+                ]
+            }
+        }
 
-    best_result = None
-    best_confidence = -1.0
+    evidences: list[Evidence] = []
 
-    for img in images:
-        result = analyze_diagram(img.image_bytes)
-        if result.confidence > best_confidence:
-            best_confidence = result.confidence
-            best_result = result
+    _vision_tool_names = ", ".join(t.name for t in _VISION_TOOLS)
 
-    if best_result is None or best_result.error:
-        error_detail = best_result.error if best_result else "unknown"
-        evidences["vision"] = [
-            _fail(
-                "swarm_visual",
-                f"Vision analysis failed: {error_detail}",
-            )
-        ]
-        return {"evidences": evidences}
-
-    is_accurate = best_result.classification == "accurate_stategraph"
-    evidences["vision"] = [
-        Evidence(
-            goal="swarm_visual",
-            found=True,
-            content=best_result.description,
-            location=str(pdf_path),
-            rationale=(
-                f"Diagram classification: {best_result.classification}. "
-                f"Has parallel branches: {best_result.has_parallel_branches}. "
-                f"{best_result.description}"
-            ),
-            confidence=best_result.confidence if is_accurate else best_result.confidence * 0.5,
+    for dim in dimensions:
+        user_message = (
+            f"Audit dimension '{dim['id']}' using diagrams in the PDF: {pdf_path}\n"
+            f"You have access to ONLY these tools: {_vision_tool_names}\n"
+            "Call extract_and_analyze_diagrams to extract and classify all diagrams. "
+            "Do NOT attempt to call any tool not listed above."
         )
-    ]
+        try:
+            ev = _run_detective_agent(dim, user_message, _VISION_TOOLS, "vision_inspector")
+        except Exception as exc:
+            ev = Evidence(
+                goal=dim["id"],
+                found=False,
+                location="unknown",
+                rationale=f"Agent run failed: {exc}",
+                confidence=0.0,
+            )
+        evidences.append(ev)
 
-    return {"evidences": evidences}
+    return {"evidences": {"vision": evidences}}
