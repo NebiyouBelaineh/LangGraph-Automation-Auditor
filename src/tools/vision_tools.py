@@ -1,6 +1,10 @@
 """Vision tools for diagram analysis in the VisionInspector detective node.
 
 Covers rubric dimension: swarm_visual.
+
+Each function exists in two forms:
+- The raw function (e.g. extract_images_from_pdf, analyze_diagram) — deterministic.
+- The @tool wrapper (extract_and_analyze_diagrams) — LangChain tool for LLM agent loops.
 """
 
 import base64
@@ -252,5 +256,53 @@ def _analyze_with_openai(image_bytes: bytes, api_key: str) -> DiagramAnalysisRes
     )
 
 
-# lazy import for _analyze_with_anthropic
-import re  # noqa: E402  (needed inside the function above; import here for module scope)
+import re  # noqa: E402  (used inside _analyze_with_anthropic above)
+
+
+# ---------------------------------------------------------------------------
+# LangChain tool wrapper — used by LLM detective agents
+# ---------------------------------------------------------------------------
+
+from langchain_core.tools import tool  # noqa: E402
+
+
+@tool
+def extract_and_analyze_diagrams(pdf_path: str) -> dict:
+    """Extract images from a PDF and analyze each for architectural diagram accuracy.
+
+    Classifies diagrams and checks whether they accurately show a parallel LangGraph
+    StateGraph (fan-out detectives, fan-in aggregator, fan-out judges, chief justice).
+    Returns the best-matching classification and confidence across all diagrams found.
+    """
+    images = extract_images_from_pdf(pdf_path)
+    if not images:
+        return {"ok": False, "images_found": 0, "error": "No images found in PDF"}
+
+    analyzed = []
+    best_confidence = -1.0
+    best: DiagramAnalysisResult | None = None
+
+    for img in images[:5]:
+        result = analyze_diagram(img.image_bytes)
+        analyzed.append({
+            "page": img.page_number,
+            "classification": result.classification,
+            "description": result.description,
+            "has_parallel_branches": result.has_parallel_branches,
+            "confidence": result.confidence,
+            "error": result.error,
+        })
+        if result.confidence > best_confidence:
+            best_confidence = result.confidence
+            best = result
+
+    return {
+        "ok": True,
+        "images_found": len(images),
+        "diagrams_analyzed": len(analyzed),
+        "best_classification": best.classification if best else None,
+        "best_description": best.description if best else None,
+        "best_confidence": best_confidence,
+        "has_parallel_branches": best.has_parallel_branches if best else False,
+        "all_results": analyzed,
+    }

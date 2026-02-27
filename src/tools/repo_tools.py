@@ -2,6 +2,10 @@
 
 Covers rubric dimensions: git_forensic_analysis, state_management_rigor,
 graph_orchestration, safe_tool_engineering.
+
+Each function exists in two forms:
+- The raw function (e.g. clone_repo_sandboxed) — deterministic, returns a dataclass.
+- The @tool wrapper (e.g. clone_repo) — LangChain tool for use in LLM agent loops.
 """
 
 import ast
@@ -242,3 +246,102 @@ def analyze_graph_structure(repo_path: str | Path) -> GraphAnalysisResult:
         conditional_edges_count=visitor.conditional_edges_count,
         source_file=str(graph_file),
     )
+
+
+# ---------------------------------------------------------------------------
+# LangChain tool wrappers — used by LLM detective agents
+# ---------------------------------------------------------------------------
+
+from langchain_core.tools import tool  # noqa: E402
+
+
+@tool
+def clone_repo(repo_url: str) -> dict:
+    """Clone a GitHub repository to a temporary directory for forensic analysis.
+
+    Returns cloned_path which must be passed to subsequent repo analysis tools.
+    """
+    result = clone_repo_sandboxed(repo_url)
+    return {
+        "ok": result.ok,
+        "cloned_path": result.cloned_path or "",
+        "error": result.error or "",
+        "details": result.details or "",
+    }
+
+
+@tool
+def read_git_history(cloned_path: str) -> dict:
+    """Read and analyze the git commit history of a cloned repository.
+
+    Returns commit count, build-phase progression detection, and recent commit messages.
+    """
+    result = extract_git_history(cloned_path)
+    if not result.ok:
+        return {"ok": False, "error": result.error}
+    commits_summary = [
+        {"hash": c.hash[:8], "date": c.date, "message": c.message}
+        for c in result.commits[:30]
+    ]
+    return {
+        "ok": True,
+        "commit_count": result.commit_count,
+        "progression_detected": result.progression_detected,
+        "progression_summary": result.progression_summary,
+        "commits": commits_summary,
+    }
+
+
+@tool
+def run_graph_structure_analysis(cloned_path: str) -> dict:
+    """Analyze the LangGraph StateGraph structure in a cloned repository using AST parsing.
+
+    Returns nodes, edges, fan-out/fan-in detection, and conditional edge count.
+    """
+    result = analyze_graph_structure(cloned_path)
+    if not result.ok:
+        return {"ok": False, "error": result.error, "source_file": result.source_file}
+    return {
+        "ok": True,
+        "nodes": result.nodes,
+        "edges": result.edges,
+        "has_parallel_branches": result.has_parallel_branches,
+        "has_fan_in": result.has_fan_in,
+        "conditional_edges_count": result.conditional_edges_count,
+        "source_file": result.source_file,
+    }
+
+
+@tool
+def scan_file_for_patterns(cloned_path: str, relative_path: str, patterns: list[str]) -> dict:
+    """Check whether specific text patterns exist in a file within the cloned repository.
+
+    Use to verify presence of code constructs, class names, imports, or keywords.
+    relative_path is relative to the repo root (e.g. 'src/state.py').
+    """
+    file_path = Path(cloned_path) / relative_path
+    if not file_path.exists():
+        return {"ok": False, "exists": False, "error": f"File not found: {relative_path}"}
+    try:
+        source = file_path.read_text(errors="replace")
+        patterns_found = {p: p in source for p in patterns}
+        return {"ok": True, "exists": True, "patterns_found": patterns_found}
+    except OSError as exc:
+        return {"ok": False, "exists": True, "error": str(exc)}
+
+
+@tool
+def list_repo_files(cloned_path: str, glob_pattern: str = "**/*.py") -> dict:
+    """List files in the cloned repository matching a glob pattern.
+
+    Use to discover whether specific files or directories exist in the repo.
+    Returns up to 60 matching file paths relative to the repo root.
+    """
+    path = Path(cloned_path)
+    if not path.exists():
+        return {"ok": False, "error": f"Path not found: {cloned_path}"}
+    try:
+        matched = [str(p.relative_to(path)) for p in path.glob(glob_pattern) if p.is_file()]
+        return {"ok": True, "files": matched[:60], "total_matched": len(matched)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}

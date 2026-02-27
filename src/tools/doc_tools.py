@@ -1,6 +1,10 @@
 """Document analysis tools for the DocAnalyst detective node.
 
 Covers rubric dimensions: theoretical_depth, report_accuracy.
+
+Each function exists in two forms:
+- The raw function (e.g. ingest_pdf) — deterministic, returns a dataclass.
+- The @tool wrapper (e.g. query_pdf_for_term) — LangChain tool for LLM agent loops.
 """
 
 import math
@@ -204,3 +208,68 @@ def extract_file_paths_from_text(chunks: list[Chunk]) -> list[str]:
         for match in _FILE_PATH_RE.finditer(chunk.text):
             found.add(match.group(0))
     return sorted(found)
+
+
+# ---------------------------------------------------------------------------
+# LangChain tool wrappers — used by LLM detective agents
+# ---------------------------------------------------------------------------
+
+from langchain_core.tools import tool  # noqa: E402
+
+_pdf_chunk_cache: dict[str, list[Chunk]] = {}
+
+
+def _get_chunks(pdf_path: str) -> tuple[list[Chunk], str | None]:
+    """Return cached PDF chunks, ingesting on first call. Returns (chunks, error)."""
+    if pdf_path not in _pdf_chunk_cache:
+        result = ingest_pdf(pdf_path)
+        if not result.ok:
+            return [], result.error
+        _pdf_chunk_cache[pdf_path] = result.chunks
+    return _pdf_chunk_cache[pdf_path], None
+
+
+@tool
+def query_pdf_for_term(pdf_path: str, query: str) -> dict:
+    """Search a PDF document for content related to a specific query term or concept.
+
+    Returns the best matching text snippet and its relevance score.
+    Call multiple times with different queries to cover all rubric concepts.
+    """
+    chunks, error = _get_chunks(pdf_path)
+    if error:
+        return {"ok": False, "query": query, "error": error}
+    result = query_pdf(chunks, query, top_k=3)
+    if not result.ok:
+        return {"ok": False, "query": query, "error": result.error}
+    top = result.matches[0] if result.matches else None
+    return {
+        "ok": True,
+        "query": query,
+        "matches_found": len(result.matches),
+        "top_match": {
+            "text_snippet": top.text_snippet,
+            "score": top.score,
+            "page": top.page_range[0],
+        } if top else None,
+    }
+
+
+@tool
+def extract_and_check_file_paths(pdf_path: str) -> dict:
+    """Extract all file paths mentioned in a PDF and verify which ones exist on disk.
+
+    Returns two lists: existing (verified) paths and hallucinated (missing) paths.
+    """
+    chunks, error = _get_chunks(pdf_path)
+    if error:
+        return {"ok": False, "error": error}
+    mentioned = extract_file_paths_from_text(chunks)
+    existing = [p for p in mentioned if Path(p).exists()]
+    hallucinated = [p for p in mentioned if not Path(p).exists()]
+    return {
+        "ok": True,
+        "total_paths_mentioned": len(mentioned),
+        "existing": existing,
+        "hallucinated": hallucinated,
+    }
