@@ -6,14 +6,36 @@ graph_orchestration, safe_tool_engineering.
 Each function exists in two forms:
 - The raw function (e.g. clone_repo_sandboxed) — deterministic, returns a dataclass.
 - The @tool wrapper (e.g. clone_repo) — LangChain tool for use in LLM agent loops.
+
+Security design
+---------------
+- All git operations run inside ``tempfile.TemporaryDirectory()``.
+- ``subprocess.run()`` is always called with an explicit argument list (no ``shell=True``),
+  eliminating shell-injection via URL metacharacters.
+- URL allow-listing: only ``https://`` and ``git@`` prefixes are accepted.
+- URL sanitization: whitespace, newlines, and null bytes are stripped/rejected before
+  the URL reaches subprocess, preventing embedded-command injection even without ``shell=True``.
+- Authentication failures are classified into specific error codes with user-facing messages.
+- Cloned directories are tracked in ``_ACTIVE_CLONES``; callers must invoke
+  ``cleanup_clone_dir()`` after analysis.  ``TemporaryDirectory.cleanup()`` is also
+  called automatically when the process exits via Python's finaliser chain.
 """
 
 import ast
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# Module-level clone registry
+# ---------------------------------------------------------------------------
+# Keeps TemporaryDirectory objects alive so the directory persists across
+# multiple tool calls.  Callers MUST call cleanup_clone_dir() when done.
+_ACTIVE_CLONES: dict[str, "tempfile.TemporaryDirectory[str]"] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -27,6 +49,7 @@ class CloneResult:
     cloned_path: Optional[str] = None
     error: Optional[str] = None
     details: Optional[str] = None
+    user_message: Optional[str] = None  # human-readable explanation for the caller
 
 
 @dataclass
@@ -63,34 +86,189 @@ class GraphAnalysisResult:
 # clone_repo_sandboxed
 # ---------------------------------------------------------------------------
 
+# Known stderr patterns → (error_code, user-facing message)
+_AUTH_ERROR_PATTERNS: list[tuple[str, str, str]] = [
+    (
+        "authentication failed",
+        "auth_failed",
+        "Git authentication failed. Check your credentials (HTTPS token or SSH key).",
+    ),
+    (
+        "could not read username",
+        "auth_failed",
+        "Git authentication failed: no username supplied. Use an HTTPS token URL or configure SSH.",
+    ),
+    (
+        "permission denied",
+        "auth_failed",
+        "Permission denied by the remote. Verify your SSH key or HTTPS token has read access.",
+    ),
+    (
+        "repository not found",
+        "repo_not_found",
+        "Repository not found. Check the URL and ensure the repo is public (or credentials are correct).",
+    ),
+    (
+        "could not resolve host",
+        "network_error",
+        "DNS resolution failed. Check network connectivity and the hostname in the URL.",
+    ),
+    (
+        "connection refused",
+        "network_error",
+        "Connection refused by the remote host. Check network connectivity.",
+    ),
+    (
+        "timed out",
+        "timeout_error",
+        "Git clone timed out. The repository may be too large or the network is slow.",
+    ),
+    (
+        "ssl certificate",
+        "ssl_error",
+        "SSL certificate verification failed. Check system CA certificates.",
+    ),
+    (
+        "rate limit",
+        "rate_limited",
+        "GitHub rate limit reached. Wait before retrying or authenticate to raise the limit.",
+    ),
+]
 
-def clone_repo_sandboxed(repo_url: str) -> CloneResult:
-    """Clone a git repo into a temp directory. Never touches cwd.
 
-    URL must start with https:// or git@; all others are rejected to
-    prevent command injection.
+def _classify_clone_error(stderr: str) -> tuple[str, str]:
+    """Map raw git stderr to (error_code, user_message).
+
+    Returns ("clone_failed", <raw stderr>) as the fallback.
     """
+    lower = stderr.lower()
+    for pattern, code, message in _AUTH_ERROR_PATTERNS:
+        if pattern in lower:
+            return code, message
+    return "clone_failed", f"Git clone failed: {stderr.strip()}"
+
+
+def _sanitize_url(url: str) -> tuple[str, str | None]:
+    """Sanitize a URL before validation and subprocess use.
+
+    Returns (sanitized_url, error_message_or_None).
+
+    Control characters (newlines, carriage returns, null bytes, tabs) are
+    rejected on the raw URL before stripping, because they can be used for
+    header injection or argument smuggling even without ``shell=True``.
+    Leading/trailing ASCII spaces are then stripped.
+    """
+    forbidden = {"\n", "\r", "\x00", "\t"}
+    if any(ch in url for ch in forbidden):
+        return url, f"URL contains illegal control characters: {url!r}"
+    return url.strip(), None
+
+
+def clone_repo_sandboxed(
+    repo_url: str,
+    *,
+    branch: Optional[str] = None,
+    depth: int = 50,
+) -> CloneResult:
+    """Clone a git repo into a ``TemporaryDirectory``. Never touches cwd.
+
+    Security layers applied (in order):
+    1. URL sanitization — strip whitespace; reject newlines and null bytes.
+    2. URL allow-listing — only ``https://`` and ``git@`` prefixes accepted.
+    3. Temp-directory isolation — clone target is always inside the OS temp path,
+       never the auditor's working directory.
+    4. No ``shell=True`` — arguments are passed as a list; the shell never
+       interprets URL metacharacters.
+    5. Return-code checking — non-zero exit is classified into a specific error
+       code (auth_failed, repo_not_found, network_error, …) with a user-facing
+       message.
+
+    The created ``TemporaryDirectory`` is kept alive in ``_ACTIVE_CLONES``.
+    Callers MUST call ``cleanup_clone_dir(cloned_path)`` after analysis.
+
+    Args:
+        repo_url: Remote URL to clone.
+        branch:   Branch, tag, or commit SHA passed as ``--branch`` to git clone.
+                  ``None`` clones the remote HEAD (default).
+        depth:    Shallow-clone depth passed as ``--depth`` to git clone.
+                  ``0`` performs a full (non-shallow) clone.
+    """
+    # ── 1. URL sanitization ─────────────────────────────────────────────────
+    repo_url, sanitize_err = _sanitize_url(repo_url)
+    if sanitize_err:
+        return CloneResult(
+            ok=False,
+            error="invalid_url",
+            details=sanitize_err,
+            user_message="The provided URL contains illegal characters and was rejected.",
+        )
+
+    # ── 2. URL allow-listing ────────────────────────────────────────────────
     if not (repo_url.startswith("https://") or repo_url.startswith("git@")):
         return CloneResult(
             ok=False,
             error="invalid_url",
             details=f"URL must start with https:// or git@, got: {repo_url!r}",
+            user_message=(
+                "Invalid URL scheme. Only HTTPS (https://) and SSH (git@) URLs are accepted."
+            ),
         )
 
-    tmp = tempfile.mkdtemp(prefix="auditor_clone_")
+    # ── 3. Temp-directory isolation ─────────────────────────────────────────
+    # TemporaryDirectory() is used (not mkdtemp) so that the OS-level cleanup
+    # guarantee is maintained.  The object is stored in _ACTIVE_CLONES to keep
+    # the directory alive until the caller explicitly calls cleanup_clone_dir().
+    td = tempfile.TemporaryDirectory(prefix="auditor_clone_")
+    _ACTIVE_CLONES[td.name] = td
+    tmp = td.name
+
+    # ── 4. Subprocess with explicit argument list (no shell=True) ───────────
+    cmd: list[str] = ["git", "clone"]
+    if depth > 0:
+        cmd += ["--depth", str(depth)]
+    if branch:
+        cmd += ["--branch", branch]
+    cmd += [repo_url, tmp]
+
     result = subprocess.run(
-        ["git", "clone", "--depth", "50", repo_url, tmp],
+        cmd,
         capture_output=True,
         text=True,
         timeout=120,
     )
+
+    # ── 5. Return-code checking with classified error messages ──────────────
     if result.returncode != 0:
+        # Directory is empty; remove it immediately so we don't leave orphans.
+        _ACTIVE_CLONES.pop(tmp, None)
+        td.cleanup()
+        error_code, user_message = _classify_clone_error(result.stderr)
         return CloneResult(
             ok=False,
-            error="clone_failed",
+            error=error_code,
             details=result.stderr.strip(),
+            user_message=user_message,
         )
+
     return CloneResult(ok=True, cloned_path=tmp)
+
+
+def cleanup_clone_dir(cloned_path: str) -> bool:
+    """Remove the TemporaryDirectory created by ``clone_repo_sandboxed``.
+
+    Returns True if the directory was found and cleaned up, False otherwise.
+    Always safe to call; silently handles missing paths.
+    """
+    td = _ACTIVE_CLONES.pop(cloned_path, None)
+    if td is not None:
+        td.cleanup()
+        return True
+    # Fallback for paths not in the registry (e.g. tests using real temp dirs).
+    path = Path(cloned_path)
+    if path.exists() and path.is_dir():
+        shutil.rmtree(cloned_path, ignore_errors=True)
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +438,7 @@ def clone_repo(repo_url: str) -> dict:
     """Clone a GitHub repository to a temporary directory for forensic analysis.
 
     Returns cloned_path which must be passed to subsequent repo analysis tools.
+    Call cleanup_clone when analysis is complete to remove the temporary directory.
     """
     result = clone_repo_sandboxed(repo_url)
     return {
@@ -267,7 +446,19 @@ def clone_repo(repo_url: str) -> dict:
         "cloned_path": result.cloned_path or "",
         "error": result.error or "",
         "details": result.details or "",
+        "user_message": result.user_message or "",
     }
+
+
+@tool
+def cleanup_clone(cloned_path: str) -> dict:
+    """Remove the temporary directory created by clone_repo.
+
+    Must be called after analysis is complete to avoid orphaned temp directories.
+    Returns whether the directory was found and successfully removed.
+    """
+    removed = cleanup_clone_dir(cloned_path)
+    return {"ok": removed, "cloned_path": cloned_path}
 
 
 @tool
