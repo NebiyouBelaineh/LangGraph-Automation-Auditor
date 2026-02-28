@@ -6,8 +6,9 @@
 
 ## Table of Contents
 
-1. [Project Overview](#1-project-overview)
-2. [Architecture Decisions](#2-architecture-decisions)
+1. [Executive Summary](#executive-summary)
+2. [Project Overview](#1-project-overview)
+3. [Architecture Decisions](#2-architecture-decisions)
    - [2.0 Theoretical Framework: Key Concepts and Implementation](#20-theoretical-framework-how-the-architecture-implements-key-concepts)
    - [2.1 Why Pydantic + TypedDict over Plain Dicts](#21-why-pydantic--typeddict-over-plain-dicts)
    - [2.2 State Reducers: Preventing Parallel Overwrites](#22-state-reducers-preventing-parallel-overwrites)
@@ -17,18 +18,33 @@
    - [2.6 Vision Analysis: Graceful Degradation](#26-vision-analysis-graceful-degradation)
    - [2.7 LLM Provider Selection for the Judicial Layer](#27-llm-provider-selection-for-the-judicial-layer)
    - [2.8 Deterministic Chief Justice: No Fourth LLM Call](#28-deterministic-chief-justice-no-fourth-llm-call)
-3. [Final StateGraph Flow](#3-final-stategraph-flow)
+4. [Final StateGraph Flow](#3-final-stategraph-flow)
    - [3.1 Complete Node Topology](#31-complete-node-topology)
    - [3.2 Conditional Edge Logic](#32-conditional-edge-logic)
    - [3.3 Full State Data Flow](#33-full-state-data-flow)
-4. [Rubric Dimension Coverage](#4-rubric-dimension-coverage)
-5. [Judicial Layer Implementation](#5-judicial-layer-implementation)
+5. [Rubric Dimension Coverage](#4-rubric-dimension-coverage)
+   - [4.1 Self-Audit Criterion Breakdown](#41-self-audit-criterion-breakdown)
+6. [Judicial Layer Implementation](#5-judicial-layer-implementation)
    - [5.1 Judge Personas and Structured Output](#51-judge-personas-and-structured-output)
    - [5.2 Chief Justice Conflict-Resolution Rules](#52-chief-justice-conflict-resolution-rules)
    - [5.3 Variance Re-evaluation and Dissent](#53-variance-re-evaluation-and-dissent)
    - [5.4 Metacognitive Evaluation Loop](#54-metacognitive-evaluation-loop)
-6. [Implementation Status](#6-implementation-status)
-7. [Environment and Observability](#7-environment-and-observability)
+7. [Implementation Status](#6-implementation-status)
+8. [MinMax Feedback Loop Reflection](#7-minmax-feedback-loop-reflection)
+9. [Remediation Plan](#8-remediation-plan)
+10. [Environment and Observability](#9-environment-and-observability)
+
+---
+
+## Executive Summary
+
+The **Automaton Auditor** is a three-layer Digital Courtroom (Detective → Judicial → Supreme Court) built on LangGraph, with parallel fan-out/fan-in topology, deterministic Chief Justice synthesis, and metacognitive evaluation loops. **Self-audit aggregate score: 3.70 / 5.00.** Strong areas include Git Forensic Analysis, State Management Rigor, Graph Orchestration, Structured Output Enforcement, and Report Accuracy (all 5/5). Adequate areas: Safe Tool Engineering and Judicial Nuance (3/5). Critical gaps identified: Chief Justice Synthesis Engine and Architectural Diagram Analysis (1/5 in self-audit; the peer audit scored Chief Justice higher at 4/5, indicating possible detective evidence-collection variance).
+
+**Most impactful peer finding:** The peer's agent flagged that our report exhibited "systematic keyword dropping" on Theoretical Depth — Dialectical Synthesis and Fan-In/Fan-Out appeared in API context rather than architectural explanation, and Metacognition was reported as "completely absent." This prompted us to expand §2.0 and §5.4 with concrete implementation grounding.
+
+**Top remaining gap:** Architectural Diagram Analysis (swarm_visual) — the VisionInspector's diagram classification and confidence heuristics need stronger alignment with the rubric's success pattern for "accurate_stategraph" detection.
+
+**Primary remediation priority:** Strengthen judge persona prompts with explicit adversarial/forgiving/pragmatic directives (Judicial Nuance) and verify Chief Justice synthesis is correctly detected by the forensic pipeline. See §8 Remediation Plan for the full action list.
 
 ---
 
@@ -526,6 +542,31 @@ All seven dimensions are evaluated by all three judge personas (`Prosecutor`, `D
 
 ---
 
+## 4.1 Self-Audit Criterion Breakdown
+
+The self-audit (see `audit/report_onself_generated/audit_report.md`) produced an aggregate score of **3.70 / 5.00** across 10 rubric dimensions. Below is a per-dimension breakdown with final scores, judge disagreement summary, and rationale for where the score landed.
+
+| Dimension | Final Score | Prosecutor | Defense | Tech Lead | Key Disagreement / Resolution |
+|-----------|-------------|------------|---------|-----------|-------------------------------|
+| Git Forensic Analysis | 5/5 | 5 | 5 | 5 | None — unanimous. 53 commits, clear phase progression. |
+| State Management Rigor | 5/5 | 5 | 5 | 5 | None — unanimous. Pydantic, TypedDict, reducers confirmed. |
+| Graph Orchestration Architecture | 5/5 | 5 | 5 | 5 | None — unanimous. Dual fan-out/fan-in, AST-verified. |
+| Safe Tool Engineering | 3/5 | 4 | 5 | 5 | Prosecutor cited 8% forensic gap (auth error handling, URL parsing). Chief Justice applied default weighted average. |
+| Structured Output Enforcement | 5/5 | 5 | 5 | 5 | None — unanimous. `with_structured_output`, retry, ValidationError handling. |
+| Judicial Nuance and Dialectics | 3/5 | 3 | 4 | 3 | All agreed personas lack explicit preambles ("You are a Prosecutor"). Tech Lead remediation: add explicit adversarial/forgiving/pragmatic directives. |
+| Chief Justice Synthesis Engine | 1/5 | 1 | 2 | 1 | Prosecutor and Tech Lead: no hardcoded rules detected; Detective `content: null`. Defense argued partial infrastructure exists. *Note: Implementation has since been completed; see §5.2.* |
+| Theoretical Depth (Documentation) | 4/5 | 2 | 5 | 5 | **Dissent.** Prosecutor argued keyword dropping; Defense/Tech Lead cited concrete grounding. Tech Lead tie-breaker (Functionality Weight) resolved to 4. |
+| Report Accuracy (Cross-Reference) | 5/5 | 5 | 5 | 5 | None — unanimous. All 7 PDF paths verified in repo. |
+| Architectural Diagram Analysis | 1/5 | 1 | 1 | 1 | Unanimous. Diagram classification and swarm_visual alignment need improvement. |
+
+**Weak dimensions addressed directly:**
+
+- **Chief Justice Synthesis Engine (1/5):** The self-audit detective failed to retrieve `justice.py` content (`content: null`), leading to a low confidence score. The implementation in `src/nodes/justice.py` does include hardcoded Security Override, Fact Supremacy, Functionality Weight, and Variance Re-evaluation rules. The gap is partly forensic (detective evidence collection) and partly documentation (ensuring the report and code are discoverable by the audit pipeline).
+- **Judicial Nuance (3/5):** The three judges have distinct philosophical language (gaps/security vs. intent/workarounds vs. architectural/maintainability) but lack explicit persona preambles. Remediation: add "You are an adversarial Prosecutor..."-style directives in `src/nodes/judges.py`.
+- **Architectural Diagram Analysis (1/5):** VisionInspector's `analyze_diagram` and confidence heuristics need stronger alignment with the rubric's `accurate_stategraph` success pattern. The dimension is fully implemented but may not satisfy the forensic success criteria.
+
+---
+
 ## 5. Judicial Layer Implementation
 
 ### 5.1 Judge Personas and Structured Output
@@ -694,14 +735,59 @@ All components described in the interim submission's "Known Gaps" section are no
 | `audit_report_to_markdown()` serialiser | `src/utils/report_writer.py` | ✓ Implemented — structured Markdown output from `AuditReport` |
 | Full graph wiring (detective + judicial fan-out/fan-in) | `src/graph.py` | ✓ Implemented — `evidence_aggregator → [prosecutor, defense, tech_lead] → chief_justice → END` |
 
-**Remaining known limitations:**
+---
 
-- **Dynamic rubric routing in judges:** All judge nodes currently iterate over `state["rubric_dimensions"]` and produce one opinion per dimension. A future enhancement would match each dimension to its canonical detective bucket before routing, giving judges explicit context about whether the evidence came from a repo scan, PDF analysis, or vision analysis.
-- **Incremental evidence persistence:** Evidence is written only at run completion. If the process crashes mid-run, evidence collected so far is lost unless the run is resumed with the same `--thread-id` (LangGraph checkpointing is wired in `main.py`).
+## 7. MinMax Feedback Loop Reflection
+
+The MinMax loop involves (1) receiving an audit from a peer's agent on our repo, (2) making changes in response, (3) auditing the peer's repo with our agent, and (4) learning how being audited improved our own auditor.
+
+### Findings from our peer's audit of our repo
+
+The peer's agent (`audit/report_bypeer_received/audit_report.md`) produced an overall score of **3.60 / 5.00**. Key findings:
+
+- **Graph Orchestration (3/5):** The peer's Tech Lead reported that the prosecutor, defense, tech_lead, and chief_justice nodes were "orphaned from the main graph flow" and that the graph "terminates at EvidenceAggregator with no downstream judge fan-out." Remediation suggested: add edges from `evidence_aggregator` to the three judges, create a judge aggregator, and wire to `chief_justice`.
+- **Theoretical Depth (1/5):** The peer's Prosecutor and Tech Lead flagged "systematic keyword dropping" — Dialectical Synthesis and Fan-In/Fan-Out appeared in API configuration context rather than architectural explanation; Metacognition was reported as "completely absent" (0 matches). The report was criticised for lacking substantive *how* explanations tying terms to graph edges and implementation.
+- **Architectural Diagram Analysis (1/5):** Both audits (self and peer) scored this dimension 1/5, indicating consistent weakness in diagram classification and swarm_visual alignment.
+
+### Changes we made in response
+
+1. **Graph wiring verification:** We confirmed that `src/graph.py` already wires `evidence_aggregator` → `[prosecutor, defense, tech_lead]` → `chief_justice`. The peer may have audited an earlier version or the peer's detective failed to parse our graph structure. We added explicit diagram labels in §3.1 (e.g. "Fan-out", "Fan-in") to make the topology unambiguous for future audits.
+2. **Theoretical Depth expansion:** We expanded §2.0 and §5.4 to ground Dialectical Synthesis, Fan-In/Fan-Out, and Metacognition in concrete implementation details — named edges, reducer semantics, variance re-evaluation, and fact supremacy. We moved explanations from generic API context into dedicated architectural sections.
+3. **Report structure:** We ensured the report explicitly maps each concept to file paths and code patterns (e.g. `src/nodes/justice.py`, `operator.ior`, `_weighted_score`).
+
+### Findings from our audit of the peer's repo
+
+Our agent audited the peer's repository (`https://github.com/Bnobody47/The-Auditor`; see `audit/report_onpeer_generated/audit-report.md`), producing an overall score of **2.70 / 5.00**. Notable findings:
+
+- **Graph Orchestration (1/5):** Our detective encountered a Pydantic validation error (missing `confidence` field) and returned `confidence=0.0`. The peer's graph structure could not be validated. This revealed a robustness gap in our own evidence schema — our `Evidence` model must always include `confidence` to avoid pipeline failure.
+- **Safe Tool Engineering (1/5):** We identified raw `os.system()` calls, absent input sanitization on `repo_url`, and improper sandboxing (no `with tempfile.TemporaryDirectory()` context manager). Our agent produced file-level remediation instructions.
+- **Structured Output (4/5):** The peer had `.with_structured_output()` and Pydantic validation but lacked explicit retry logic for malformed outputs. Our Prosecutor flagged this gap.
+
+### How being audited improved our own auditor
+
+1. **Evidence schema robustness:** The peer's repo triggered a Pydantic validation failure in our graph orchestration detective. We had not previously tested our auditor against a repo where the AST scan returns partial or malformed evidence. Being audited ourselves did not surface this directly, but auditing the peer revealed that our `Evidence` schema and detective emission logic must handle edge cases (e.g. optional `confidence` with a sensible default) to avoid cascading failures.
+2. **Report discoverability:** The peer's criticism of "keyword dropping" and "Metacognition absent" led us to ensure that architectural terms appear in implementation-focused sections with explicit file and function references. We improved our DocAnalyst's PDF query set and our report structure so that future audits can trace concepts to code.
+3. **Systemic insight:** Our Prosecutor persona was initially calibrated to be strict on security (Safe Tool Engineering) and graph structure. Auditing the peer's repo — which had `os.system()` and a linear pipeline — reinforced that our sandboxing and AST-based graph detection are correctly aligned with the rubric's failure patterns. The experience validated our design: our auditor's detection of these violations in the peer's codebase confirmed that our own implementation (subprocess.run, tempfile.mkdtemp, AST parsing) satisfies the success pattern we enforce on others.
 
 ---
 
-## 7. Environment and Observability
+## 8. Remediation Plan
+
+The following items are ordered by impact and dependency. Each identifies the gap, the affected rubric dimension, the file or component to modify, the concrete change, and the expected score improvement.
+
+| # | Gap | Rubric Dimension | File / Component | Concrete Change | Expected Impact |
+|---|-----|------------------|------------------|-----------------|-----------------|
+| 1 | Judge personas lack explicit adversarial/forgiving/pragmatic directives | Judicial Nuance and Dialectics | `src/nodes/judges.py` | Add explicit persona preambles to each judge's system prompt: e.g. "You are an adversarial Prosecutor. Your mandate is to find gaps, security flaws, and laziness. Assign low scores to reward rigor." Add 3–5 conflicting directives per persona. | 3 → 4 or 5 |
+| 2 | Chief Justice synthesis may not be correctly detected by forensic pipeline | Chief Justice Synthesis Engine | `src/nodes/justice.py`, detective tools | Ensure `_has_security_flaw`, `apply_rule_of_evidence`, `_weighted_score`, and `_dissent_summary` are discoverable (e.g. docstrings, named constants). Add integration test that runs self-audit and asserts `chief_justice_synthesis` evidence is emitted. | 1 → 4 or 5 |
+| 3 | Diagram classification and swarm_visual alignment weak | Architectural Diagram Analysis (swarm_visual) | `src/nodes/detectives.py` (VisionInspector), `src/tools/vision_tools.py` | Refine `analyze_diagram` prompts and confidence heuristics to explicitly detect `accurate_stategraph` (parallel fan-out/fan-in LangGraph nodes). Add test with sample diagram asserting correct classification. | 1 → 3 or 4 |
+| 4 | Dynamic rubric routing — judges lack explicit detective-bucket context | Theoretical Depth, Report Accuracy | `src/nodes/judges.py`, `state["rubric_dimensions"]` | Match each dimension to its canonical detective bucket (`repo`, `doc`, `vision`) before routing. Pass bucket metadata into judge prompts so they know whether evidence came from repo scan, PDF, or vision. | Improves judge reasoning quality |
+| 5 | Incremental evidence persistence — evidence lost on crash | Implementation robustness | `main.py`, LangGraph checkpointing | Evidence is currently written only at run completion. Verify `--thread-id` checkpointing persists evidence; or add periodic evidence flush to disk during long runs. | Reduces data loss risk |
+
+An engineer unfamiliar with the codebase can use this table to prioritise work: start with items 1–3 for rubric score improvement, then 4–5 for robustness.
+
+---
+
+## 9. Environment and Observability
 
 ### Environment Variables
 
