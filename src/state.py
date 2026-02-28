@@ -74,6 +74,8 @@ class AgentState(TypedDict):
     repo_url: str
     pdf_path: str
     rubric_dimensions: List[Dict]
+    clone_options: Dict  # optional git-clone flags: branch, depth
+    skip_detectives: bool  # True → bypass detective nodes; evidences pre-loaded from --evidence-path
     evidences: Annotated[
         Dict[str, List[Evidence]], operator.ior
     ]

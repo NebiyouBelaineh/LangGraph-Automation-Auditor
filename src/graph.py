@@ -1,12 +1,20 @@
-"""LangGraph graph definition for the Automaton Auditor (First stage).
+"""LangGraph graph definition for the Automaton Auditor.
 
 Topology:
-    START → entry_node
-    entry_node → [repo_investigator, doc_analyst, vision_inspector]  (fan-out)
+    START → entry
+    entry → [repo_investigator, doc_analyst, vision_inspector]   (detective fan-out)
     [repo_investigator, doc_analyst, vision_inspector] → evidence_aggregator  (fan-in)
-    evidence_aggregator → END
+    evidence_aggregator → [prosecutor, defense, tech_lead]       (judicial fan-out)
+    [prosecutor, defense, tech_lead] → chief_justice             (fan-in)
+    chief_justice → END
 
-Conditional edges: entry_node routes to END early when inputs are missing/invalid.
+    abort path: entry → abort → END  (invalid inputs)
+
+Conditional edges
+-----------------
+entry_node uses _input_router to decide:
+  • "detectives" → normal run or skip_detectives no-op (evidence already loaded)
+  • "abort"      → missing/invalid repo_url / pdf_path
 
 Checkpointing
 -------------
@@ -27,6 +35,8 @@ from src.nodes.detectives import (
     repo_investigator_node,
     vision_inspector_node,
 )
+from src.nodes.judges import defense_node, prosecutor_node, tech_lead_node
+from src.nodes.justice import chief_justice_node
 from src.state import AgentState, Evidence
 
 
@@ -113,7 +123,16 @@ def evidence_aggregator_node(state: AgentState) -> dict[str, Any]:
 
 
 def _input_router(state: AgentState) -> Literal["detectives", "abort"]:
-    """Route to detective fan-out or abort early on missing inputs."""
+    """Route to detective fan-out, or abort early on missing inputs.
+
+    When skip_detectives is True the detective nodes are all no-ops, so we
+    can route to "detectives" without running any actual investigation —
+    the pre-loaded evidences in state will flow straight through to
+    evidence_aggregator unchanged.
+    """
+    if state.get("skip_detectives"):
+        return "detectives"
+
     repo_url = state.get("repo_url", "").strip()
     pdf_path = state.get("pdf_path", "").strip()
 
@@ -152,6 +171,7 @@ def _abort_node(state: AgentState) -> dict[str, Any]:
 
 builder = StateGraph(AgentState)
 
+# ── Detective layer ─────────────────────────────────────────────────────────
 builder.add_node("entry", entry_node)
 builder.add_node("repo_investigator", repo_investigator_node)
 builder.add_node("doc_analyst", doc_analyst_node)
@@ -159,9 +179,17 @@ builder.add_node("vision_inspector", vision_inspector_node)
 builder.add_node("evidence_aggregator", evidence_aggregator_node)
 builder.add_node("abort", _abort_node)
 
+# ── Judicial layer ──────────────────────────────────────────────────────────
+builder.add_node("prosecutor", prosecutor_node)
+builder.add_node("defense", defense_node)
+builder.add_node("tech_lead", tech_lead_node)
+
+# ── Chief Justice layer ─────────────────────────────────────────────────────
+builder.add_node("chief_justice", chief_justice_node)
+
 builder.add_edge(START, "entry")
 
-# Conditional: valid inputs → fan-out; invalid → abort
+# Conditional: valid inputs → detective fan-out; invalid → abort
 builder.add_conditional_edges(
     "entry",
     _input_router,
@@ -179,8 +207,18 @@ builder.add_edge("repo_investigator", "evidence_aggregator")
 builder.add_edge("doc_analyst", "evidence_aggregator")
 builder.add_edge("vision_inspector", "evidence_aggregator")
 
+# Judicial fan-out: evidence_aggregator fans out to all three judges in parallel
+builder.add_edge("evidence_aggregator", "prosecutor")
+builder.add_edge("evidence_aggregator", "defense")
+builder.add_edge("evidence_aggregator", "tech_lead")
+
+# Fan-in: all three judges converge at chief_justice
+builder.add_edge("prosecutor", "chief_justice")
+builder.add_edge("defense", "chief_justice")
+builder.add_edge("tech_lead", "chief_justice")
+
 builder.add_edge("abort", END)
-builder.add_edge("evidence_aggregator", END)
+builder.add_edge("chief_justice", END)
 
 
 def make_graph(checkpointer=None):

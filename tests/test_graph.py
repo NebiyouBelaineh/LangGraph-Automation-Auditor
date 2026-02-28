@@ -1,8 +1,9 @@
 """Tests for src/graph.py.
 
 Covers: graph compilation, conditional routing, evidence aggregation,
-early-abort on invalid inputs, and end-to-end state flow.
-Detective nodes are mocked to avoid real network / LLM calls.
+early-abort on invalid inputs, skip_detectives mode, judicial layer wiring,
+and end-to-end state flow.
+Detective nodes are no-ops via skip_detectives; judicial LLMs are mocked.
 """
 
 from unittest.mock import MagicMock, patch
@@ -17,7 +18,7 @@ from src.graph import (
     evidence_aggregator_node,
     graph,
 )
-from src.state import AgentState, Evidence
+from src.state import AgentState, AuditReport, CriterionResult, Evidence, JudicialOpinion
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -28,6 +29,8 @@ def _state(**overrides) -> AgentState:
         "repo_url": "https://github.com/org/repo",
         "pdf_path": "/tmp/report.pdf",
         "rubric_dimensions": [],
+        "clone_options": {},
+        "skip_detectives": False,
         "evidences": {},
         "opinions": [],
         "final_report": None,
@@ -42,6 +45,37 @@ def _evidence(goal: str, found: bool = True) -> Evidence:
     )
 
 
+def _fake_opinion(dim_id: str = "git_forensic_analysis", judge: str = "Prosecutor") -> JudicialOpinion:
+    return JudicialOpinion(
+        judge=judge,  # type: ignore[arg-type]
+        criterion_id=dim_id,
+        score=3,
+        argument="test argument",
+        cited_evidence=["test_file.py"],
+    )
+
+
+def _rubric_dim(dim_id: str, artifact: str = "github_repo") -> dict:
+    return {
+        "id": dim_id,
+        "name": dim_id.replace("_", " ").title(),
+        "target_artifact": artifact,
+        "success_pattern": "found",
+        "failure_pattern": "not found",
+        "forensic_instruction": "check it",
+    }
+
+
+def _mock_judge_llm(dim_ids: list[str], judge: str = "Prosecutor") -> MagicMock:
+    """Return a ChatAnthropic mock whose structured-output invoke always returns a fake opinion."""
+    opinions = [_fake_opinion(d, judge) for d in dim_ids]
+    structured = MagicMock()
+    structured.invoke.side_effect = opinions + [_fake_opinion(dim_ids[-1], judge)] * 100
+    mock_llm = MagicMock()
+    mock_llm.with_structured_output.return_value = structured
+    return mock_llm
+
+
 # ── Graph compilation ────────────────────────────────────────────────────────
 
 
@@ -51,8 +85,16 @@ class TestGraphCompilation:
 
     def test_graph_has_expected_nodes(self):
         node_keys = set(graph.nodes.keys())
-        for expected in ["entry", "repo_investigator", "doc_analyst",
-                         "vision_inspector", "evidence_aggregator", "abort"]:
+        expected_nodes = [
+            # detective layer
+            "entry", "repo_investigator", "doc_analyst",
+            "vision_inspector", "evidence_aggregator", "abort",
+            # judicial layer
+            "prosecutor", "defense", "tech_lead",
+            # chief justice
+            "chief_justice",
+        ]
+        for expected in expected_nodes:
             assert expected in node_keys, f"Missing node: {expected}"
 
     def test_graph_has_start_node(self):
@@ -107,6 +149,15 @@ class TestInputRouter:
     def test_aborts_on_bare_domain(self):
         state = _state(repo_url="github.com/org/repo", pdf_path="/tmp/x.pdf")
         assert _input_router(state) == "abort"
+
+    def test_skip_detectives_bypasses_url_validation(self):
+        """skip_detectives=True routes to 'detectives' even when repo_url is empty."""
+        state = _state(repo_url="", pdf_path="", skip_detectives=True)
+        assert _input_router(state) == "detectives"
+
+    def test_skip_detectives_bypasses_invalid_url(self):
+        state = _state(repo_url="ftp://bad", pdf_path="", skip_detectives=True)
+        assert _input_router(state) == "detectives"
 
 
 # ── _abort_node ───────────────────────────────────────────────────────────────
@@ -173,58 +224,115 @@ class TestEvidenceAggregatorNode:
 
 
 class TestGraphEndToEnd:
-    def _mock_detective(self, bucket: str) -> dict:
-        """Return a partial evidences dict mimicking a detective node output."""
-        dims = _REQUIRED_DIMENSIONS[bucket]
-        return {"evidences": {bucket: [_evidence(d) for d in dims]}}
+    """End-to-end graph tests.
+
+    Detective nodes are bypassed via skip_detectives=True (no real cloning or
+    PDF parsing).  Judicial LLMs are mocked via ChatAnthropic patch so no real
+    API calls are made.
+    """
+
+    def _state_with_evidence(self, dims: list[dict]) -> AgentState:
+        """Build a state with pre-loaded evidence for each dimension."""
+        by_bucket: dict[str, list[Evidence]] = {"repo": [], "doc": [], "vision": []}
+        bucket_map = {"github_repo": "repo", "pdf_report": "doc", "pdf_images": "vision"}
+        for d in dims:
+            bucket = bucket_map.get(d["target_artifact"], "repo")
+            by_bucket[bucket].append(_evidence(d["id"]))
+        return _state(
+            skip_detectives=True,
+            rubric_dimensions=dims,
+            evidences=by_bucket,
+        )
+
+    def _patch_judges(self, dim_ids: list[str]):
+        """Return a context manager that patches ChatAnthropic for all judge nodes."""
+        # Each judge call gets its own opinion; cycle through dim_ids
+        opinions_cycle = [_fake_opinion(d, "Prosecutor") for d in dim_ids] * 10
+        structured = MagicMock()
+        structured.invoke.side_effect = opinions_cycle
+        mock_llm_inst = MagicMock()
+        mock_llm_inst.with_structured_output.return_value = structured
+        return patch("src.nodes.judges.ChatAnthropic", return_value=mock_llm_inst)
+
+    # ── abort path ───────────────────────────────────────────────────────────
 
     def test_aborts_early_on_invalid_inputs(self):
-        result = graph.invoke(
-            _state(repo_url="", pdf_path=""),
-        )
-        all_evidences = [
-            ev
-            for evs in result["evidences"].values()
-            for ev in evs
-        ]
+        """Invalid inputs (empty url/path, skip_detectives=False) trigger abort."""
+        result = graph.invoke(_state(repo_url="", pdf_path=""))
+        all_evidences = [ev for evs in result["evidences"].values() for ev in evs]
         assert all(not ev.found for ev in all_evidences)
 
-    def test_valid_inputs_pass_through_detectives(self):
-        repo_out = self._mock_detective("repo")
-        doc_out = self._mock_detective("doc")
-        vision_out = self._mock_detective("vision")
+    def test_result_state_always_contains_evidences_key(self):
+        """Even on abort the result dict has an 'evidences' key."""
+        result = graph.invoke(_state(repo_url="", pdf_path=""))
+        assert "evidences" in result
 
+    # ── skip_detectives path ─────────────────────────────────────────────────
+
+    def test_skip_detectives_preserves_preloaded_evidence(self):
+        """When skip_detectives=True, pre-loaded evidences reach evidence_aggregator intact."""
+        dims = [_rubric_dim("git_forensic_analysis")]
+        state = self._state_with_evidence(dims)
+        with self._patch_judges(["git_forensic_analysis"]):
+            result = graph.invoke(state)
+        goals = {e.goal for evs in result["evidences"].values() for e in evs}
+        assert "git_forensic_analysis" in goals
+
+    def test_skip_detectives_produces_final_report(self):
+        """Full pipeline with skip_detectives=True ends with a non-None final_report."""
+        dims = [_rubric_dim("git_forensic_analysis")]
+        state = self._state_with_evidence(dims)
+        with self._patch_judges(["git_forensic_analysis"]):
+            result = graph.invoke(state)
+        assert result.get("final_report") is not None
+
+    def test_skip_detectives_final_report_has_correct_score_range(self):
+        """chief_justice produces a score in [1, 5]."""
+        dims = [_rubric_dim("git_forensic_analysis")]
+        state = self._state_with_evidence(dims)
+        with self._patch_judges(["git_forensic_analysis"]):
+            result = graph.invoke(state)
+        report = result.get("final_report")
+        assert report is not None
+        assert 1.0 <= report.overall_score <= 5.0
+
+    def test_skip_detectives_all_required_dimensions_backfilled(self):
+        """evidence_aggregator backfills dimensions missing from pre-loaded evidence."""
+        # Only provide one dimension in evidence; aggregator should backfill the rest
+        dims = [_rubric_dim(d) for d in _REQUIRED_DIMENSIONS["repo"]]
+        state = _state(
+            skip_detectives=True,
+            rubric_dimensions=dims,
+            evidences={"repo": [_evidence("git_forensic_analysis")], "doc": [], "vision": []},
+        )
+        with self._patch_judges([d["id"] for d in dims]):
+            result = graph.invoke(state)
+        goals = {e.goal for e in result["evidences"].get("repo", [])}
+        for dim in _REQUIRED_DIMENSIONS["repo"]:
+            assert dim in goals, f"Dimension {dim!r} not backfilled"
+
+    # ── full detective → judicial path (mocked detectives) ───────────────────
+
+    def test_valid_inputs_pass_through_detectives_to_final_report(self):
+        """With mocked clone + judicial LLMs, a full run produces final_report."""
+        from src.tools.repo_tools import CloneResult
+
+        dims = [_rubric_dim("git_forensic_analysis")]
         with (
-            patch("src.nodes.detectives.clone_repo_sandboxed") as m_clone,
-            patch("src.nodes.detectives.extract_git_history") as m_git,
-            patch("src.nodes.detectives.analyze_graph_structure") as m_graph,
-            patch("src.nodes.detectives.ingest_pdf") as m_ingest,
-            patch("src.nodes.detectives.query_pdf") as m_query,
-            patch("src.nodes.detectives.extract_file_paths_from_text", return_value=[]),
-            patch("src.nodes.detectives.extract_images_from_pdf", return_value=[]),
+            patch("src.nodes.detectives.clone_repo_sandboxed",
+                  return_value=CloneResult(ok=False, error="clone_failed")),
+            patch("src.nodes.detectives.ChatAnthropic") as mock_det_llm_cls,
+            self._patch_judges(["git_forensic_analysis"]),
         ):
-            from src.tools.repo_tools import CloneResult, GitHistoryResult, GraphAnalysisResult
-            from src.tools.doc_tools import PdfIngestResult, PdfQueryResult
+            # Detective LLM returns an Evidence-structured output
+            det_ev = _evidence("git_forensic_analysis")
+            mock_det_structured = MagicMock()
+            mock_det_structured.invoke.return_value = det_ev
+            mock_det_llm_inst = MagicMock()
+            mock_det_llm_inst.with_structured_output.return_value = mock_det_structured
+            mock_det_llm_cls.return_value = mock_det_llm_inst
 
-            m_clone.return_value = CloneResult(ok=True, cloned_path="/tmp/r")
-            m_git.return_value = GitHistoryResult(ok=True, commit_count=5)
-            m_graph.return_value = GraphAnalysisResult(ok=True, nodes=[], edges=[])
-            m_ingest.return_value = PdfIngestResult(ok=False, error="file_not_found")
-
-            result = graph.invoke(_state())
-
-        # All required dimensions must be present after aggregation
-        for bucket, dims in _REQUIRED_DIMENSIONS.items():
-            goals = {e.goal for e in result["evidences"].get(bucket, [])}
-            for dim in dims:
-                assert dim in goals, f"Missing {dim!r} in {bucket!r} after full run"
-
-    def test_result_state_contains_evidences_key(self):
-        with patch("src.nodes.detectives.clone_repo_sandboxed") as m:
-            from src.tools.repo_tools import CloneResult
-            m.return_value = CloneResult(ok=False, error="clone_failed")
-            patch("src.nodes.detectives.ingest_pdf").start()
-            patch("src.nodes.detectives.extract_images_from_pdf", return_value=[]).start()
-            result = graph.invoke(_state())
+            result = graph.invoke(_state(rubric_dimensions=dims))
 
         assert "evidences" in result
+        assert result.get("final_report") is not None

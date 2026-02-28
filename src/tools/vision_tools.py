@@ -122,7 +122,8 @@ def analyze_diagram(
 ) -> DiagramAnalysisResult:
     """Send an image to a multimodal LLM for diagram classification.
 
-    Falls back gracefully if the model is not configured or `enabled=False`.
+    Provider priority: Google Gemini 2.5 Flash → Anthropic Claude → OpenAI GPT-4o.
+    Falls back gracefully if no key is configured or `enabled=False`.
     """
     if not enabled:
         return DiagramAnalysisResult(
@@ -132,11 +133,13 @@ def analyze_diagram(
             confidence=0.0,
         )
 
-    # Prefer Anthropic Claude (already a dep); fall back to OpenAI GPT-4o
+    google_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     anthropic_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("AI_MODEL_PROVIDER_API_KEY")
     openai_key = os.getenv("OPENAI_API_KEY")
 
-    if anthropic_key:
+    if google_key:
+        return _analyze_with_google(image_bytes, google_key)
+    elif anthropic_key:
         return _analyze_with_anthropic(image_bytes, anthropic_key)
     elif openai_key:
         return _analyze_with_openai(image_bytes, openai_key)
@@ -148,6 +151,56 @@ def analyze_diagram(
             confidence=0.0,
             error="no_api_key",
         )
+
+
+def _analyze_with_google(image_bytes: bytes, api_key: str) -> DiagramAnalysisResult:
+    """Analyze a diagram image using Gemini 2.5 Flash via langchain-google-genai."""
+    import json
+    import re
+
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        from langchain_core.messages import HumanMessage
+
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            google_api_key=api_key,
+            max_output_tokens=512,
+            temperature=0,
+        )
+        b64 = base64.standard_b64encode(image_bytes).decode()
+        message = HumanMessage(content=[
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{b64}"},
+            },
+            {"type": "text", "text": _DIAGRAM_PROMPT},
+        ])
+        response = llm.invoke([message])
+        raw = response.content or ""
+        json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if json_match:
+            data = json.loads(json_match.group(0))
+            return DiagramAnalysisResult(
+                classification=data.get("classification", "other"),
+                description=data.get("description", ""),
+                has_parallel_branches=bool(data.get("has_parallel_branches", False)),
+                confidence=float(data.get("confidence", 0.5)),
+            )
+    except Exception as exc:
+        return DiagramAnalysisResult(
+            classification="other",
+            description="",
+            has_parallel_branches=False,
+            confidence=0.0,
+            error=f"google_error: {exc}",
+        )
+    return DiagramAnalysisResult(
+        classification="other",
+        description="Parse error",
+        has_parallel_branches=False,
+        confidence=0.0,
+    )
 
 
 def _analyze_with_anthropic(image_bytes: bytes, api_key: str) -> DiagramAnalysisResult:

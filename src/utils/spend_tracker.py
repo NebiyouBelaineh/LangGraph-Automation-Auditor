@@ -22,21 +22,33 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
 
 # ---------------------------------------------------------------------------
-# Pricing table (USD per token)
-# Anthropic claude-3-5-haiku — update here if pricing changes.
+# Pricing table (USD per token) — Anthropic public pricing as of 2026-02.
+#
+# Keys are substrings matched against the model name returned by the API
+# (case-insensitive, first match wins).  Add new model generations here.
+#
+# Anthropic does NOT return cost in API responses; token counts are returned
+# and we calculate cost here.  For automatic cost tracking without maintaining
+# this table, consider enabling LangSmith (set LANGCHAIN_API_KEY).
 # ---------------------------------------------------------------------------
 _PRICING: dict[str, dict[str, float]] = {
-    "claude-3-5-haiku": {"input": 0.80 / 1_000_000, "output": 4.00 / 1_000_000},
-    "claude-3-5-sonnet": {"input": 3.00 / 1_000_000, "output": 15.00 / 1_000_000},
-    "claude-3-opus": {"input": 15.00 / 1_000_000, "output": 75.00 / 1_000_000},
+    # claude-haiku-4 / claude-haiku-4-5  (new naming scheme, 2025+)
+    "haiku-4":      {"input": 0.80 / 1_000_000, "output": 4.00 / 1_000_000},
+    # claude-3-5-haiku / claude-3-haiku  (legacy naming)
+    "haiku":        {"input": 0.80 / 1_000_000, "output": 4.00 / 1_000_000},
+    # claude-sonnet-4 / claude-3-5-sonnet / claude-3-sonnet
+    "sonnet":       {"input": 3.00 / 1_000_000, "output": 15.00 / 1_000_000},
+    # claude-opus-4 / claude-3-opus
+    "opus":         {"input": 15.00 / 1_000_000, "output": 75.00 / 1_000_000},
     # fallback — used when the model name doesn't match any key above
-    "default": {"input": 0.80 / 1_000_000, "output": 4.00 / 1_000_000},
+    "default":      {"input": 0.80 / 1_000_000, "output": 4.00 / 1_000_000},
 }
 
 
 def _price_per_token(model: str) -> dict[str, float]:
+    m = model.lower()
     for key, rates in _PRICING.items():
-        if key in model.lower():
+        if key != "default" and key in m:
             return rates
     return _PRICING["default"]
 
@@ -166,27 +178,44 @@ class SpendTracker(BaseCallbackHandler):
     # ------------------------------------------------------------------
 
     def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
+        """Capture token usage from every LLM response.
+
+        Prefers AIMessage.usage_metadata (standardized across all LangChain
+        providers, added in langchain-core 0.1) over the raw response_metadata
+        dict, which is provider-specific.  Falls back gracefully if neither
+        is populated.
+        """
         model = ""
         input_tokens = 0
         output_tokens = 0
 
-        # Extract usage from the first generation's message metadata
         for generations in response.generations:
             for gen in generations:
                 msg = getattr(gen, "message", None)
                 if msg is None:
                     continue
-                meta: dict = getattr(msg, "response_metadata", {}) or {}
-                usage: dict = meta.get("usage", {})
-                input_tokens += usage.get("input_tokens", 0)
-                output_tokens += usage.get("output_tokens", 0)
+
+                # ── Primary: standardized usage_metadata (langchain-core ≥ 0.1) ──
+                usage_meta = getattr(msg, "usage_metadata", None)
+                if usage_meta:
+                    input_tokens += usage_meta.get("input_tokens", 0)
+                    output_tokens += usage_meta.get("output_tokens", 0)
+                else:
+                    # ── Fallback: provider-specific response_metadata ────────────
+                    meta: dict = getattr(msg, "response_metadata", {}) or {}
+                    usage: dict = meta.get("usage", {})
+                    input_tokens += usage.get("input_tokens", 0)
+                    output_tokens += usage.get("output_tokens", 0)
+
+                # Model name: response_metadata is the reliable source for this
                 if not model:
-                    model = meta.get("model", "unknown")
+                    meta = getattr(msg, "response_metadata", {}) or {}
+                    model = meta.get("model", "") or ""
 
         if input_tokens or output_tokens:
             self.records.append(
                 CallRecord(
-                    model=model,
+                    model=model or "unknown",
                     node=self._active_node,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
