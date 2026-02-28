@@ -26,6 +26,7 @@
    - [5.1 Judge Personas and Structured Output](#51-judge-personas-and-structured-output)
    - [5.2 Chief Justice Conflict-Resolution Rules](#52-chief-justice-conflict-resolution-rules)
    - [5.3 Variance Re-evaluation and Dissent](#53-variance-re-evaluation-and-dissent)
+   - [5.4 Metacognitive Evaluation Loop](#54-metacognitive-evaluation-loop)
 6. [Implementation Status](#6-implementation-status)
 7. [Environment and Observability](#7-environment-and-observability)
 
@@ -625,6 +626,57 @@ def _weighted_score(prosecutor, defense, tech_lead, tl_weight=1) -> int:
 ```
 
 The `tl_weight` parameter is set to `2` for architecture criteria (Rule 3) and high-variance cases (Rule 4), and to `1` for the default path.
+
+---
+
+## 5.4 Metacognitive Evaluation Loop
+
+Metacognition — the system's ability to evaluate the quality of its own evaluation — is implemented across three distinct mechanisms in the Automaton Auditor. Unlike systems that blindly emit a score from a single LLM call, this auditor reflects on disagreement, challenges its own intermediate conclusions against collected facts, and documents its reasoning chain before finalising any verdict.
+
+### Confidence Score as an Evaluation Quality Signal
+
+Every `Evidence` object produced by the detective layer carries a `confidence` field (`float`, `ge=0.0`, `le=1.0`, defined in `src/state.py`). This field is not a self-reported LLM claim — it is a deterministically computed heuristic based on measurable artifact properties:
+
+- **`git_forensic_analysis`**: confidence = 0.85 when ≥ 2 development phases are detected in commit messages; 0.4 otherwise (`src/nodes/detectives.py`, `extract_git_history` heuristic).
+- **`state_management_rigor`**: confidence = 0.9 when Pydantic + TypedDict + reducer patterns are all confirmed present via AST scan; 0.5 when only partial matches are found.
+- **`graph_orchestration`**: confidence = 0.9 when both `has_parallel_branches=True` and `has_fan_in=True` are confirmed; 0.5 otherwise.
+- **`report_accuracy`**: confidence = `verified_paths / total_mentioned_paths` — the ratio of file paths in the PDF that actually exist in the repository.
+- **`swarm_visual`**: confidence = `llm_reported_confidence × 0.5` when the diagram is not classified as `accurate_stategraph`; the penalty signals low-quality visual evidence.
+
+These confidence values flow into every judge's `DETECTIVE EVIDENCE` payload (formatted in `src/nodes/judges.py`, `_invoke_judge`). A judge receiving `confidence=0.15` for a dimension knows the detective was uncertain; a judge receiving `confidence=0.98` knows the forensic evidence is conclusive. The three judges therefore calibrate their arguments against the evidence quality signal, not just the evidence content.
+
+### Score Variance as a Contradiction Detector
+
+The Chief Justice (`src/nodes/justice.py`) implements an explicit contradiction-detection step before finalising every criterion score. After collecting all three `JudicialOpinion` objects for a dimension, it computes:
+
+```python
+var = max(scores) - min(scores)
+if var > 2:
+    # High disagreement — the panel is significantly divided.
+    # Re-evaluate: double Tech Lead weight as pragmatic anchor.
+    return _weighted_score(prosecutor, defense, tech_lead, tl_weight=2)
+```
+
+A variance greater than 2 means the Prosecutor and Defense differ by at least 3 score points — a signal that the panel holds irreconcilable views. The system responds by automatically shifting weight toward the Tech Lead, who scores only 1, 3, or 5 (never hedging at 2 or 4), providing a decisive architectural anchor. This is variance re-evaluation: the system detects its own internal disagreement and adjusts the synthesis mechanism before emitting the final score.
+
+Every high-variance criterion also receives a mandatory `dissent_summary` (generated in `_dissent_summary()`, `src/nodes/justice.py`), which is preserved in the `CriterionResult` and surfaced in the Markdown report. This dissent log serves as a metacognitive audit trail: a reader can inspect exactly which judge held which position, and how the tie-breaker resolved it.
+
+### Fact Supremacy as a Self-Correction Mechanism
+
+The most direct form of metacognition in this system is `apply_rule_of_evidence()` in `src/nodes/justice.py`. This function compares the Defense attorney's judicial claim against the detective's raw forensic finding:
+
+```python
+detective_found = _evidence_found(dim_id, evidences)
+if detective_found is False and defense and defense.score >= 4:
+    # Defense is generous but the artifact does not exist.
+    # The system overrules its own optimistic judge.
+    adjusted_defense = max(defense.score - 2, 1)
+    return max(min(tl_score, adjusted_defense), prosecutor.score)
+```
+
+When the Defense argues for a high score (≥ 4) but the detective confirmed the artifact is missing (`found=False`), the system overrules its own judge. This is a direct feedback loop: the judicial layer checks its conclusions against the detective layer's ground truth, and corrects any opinion that contradicts the collected evidence. The system does not accept its own intermediate reasoning uncritically — it validates claims against artifacts before committing to a final score.
+
+Together, these three mechanisms — confidence-calibrated evidence, variance-triggered re-evaluation, and fact-supremacy correction — constitute a genuine metacognitive loop: the auditor reflects on the quality of its reasoning at each synthesis step and adjusts before emitting a final verdict.
 
 ---
 

@@ -83,6 +83,70 @@ def _evidence_found(dim_id: str, evidences: dict[str, list[Evidence]]) -> bool |
     return None
 
 
+def apply_rule_of_security(
+    prosecutor: JudicialOpinion | None,
+    defense: JudicialOpinion | None,
+    tech_lead: JudicialOpinion | None,
+) -> int | None:
+    """Rule 1 — Security Override: confirmed security flaw caps the final score at 3.
+
+    When the Prosecutor's argument contains keyword signals for a confirmed security
+    vulnerability (shell injection, unsanitized input, no sandbox, etc.), the final
+    score is hard-capped at 3, regardless of Defense or Tech Lead positions.
+
+    Returns the capped score if the rule fires, or None if it does not apply.
+    """
+    if prosecutor and _has_security_flaw(prosecutor):
+        raw = _weighted_score(prosecutor, defense, tech_lead)
+        return min(raw, 3)
+    return None
+
+
+def apply_rule_of_evidence(
+    dim_id: str,
+    defense: JudicialOpinion | None,
+    tech_lead: JudicialOpinion | None,
+    prosecutor: JudicialOpinion | None,
+    evidences: dict[str, list[Evidence]],
+) -> int | None:
+    """Rule 2 — Fact Supremacy: detective found=False overrides Defense generosity.
+
+    When the detective confirmed the artifact is missing (found=False) but the Defense
+    assigned a generous score (≥ 4), the Defense score is demoted by 2.  The final
+    score is then the minimum of the demoted Defense score and the Tech Lead score,
+    grounded in what actually exists in the repository.
+
+    Returns the adjusted score if the rule fires, or None if it does not apply.
+    """
+    detective_found = _evidence_found(dim_id, evidences)
+    if detective_found is False and defense and defense.score >= 4:
+        tl_score = tech_lead.score if tech_lead else 3
+        adjusted_defense = max(defense.score - 2, 1)
+        adjusted = min(tl_score, adjusted_defense)
+        return max(adjusted, prosecutor.score if prosecutor else 1)
+    return None
+
+
+def apply_rule_of_functionality(
+    dim_id: str,
+    prosecutor: JudicialOpinion | None,
+    defense: JudicialOpinion | None,
+    tech_lead: JudicialOpinion | None,
+) -> int | None:
+    """Rule 3 — Functionality Weight: Tech Lead carries highest weight for architecture criteria.
+
+    For architecture-critical dimensions (graph_orchestration, state_management_rigor,
+    safe_tool_engineering, chief_justice_synthesis), the Tech Lead's score is
+    double-weighted in the weighted average — the Tech Lead is the most qualified
+    judge for correctness questions on those dimensions.
+
+    Returns the weighted score if the rule fires, or None if it does not apply.
+    """
+    if dim_id in _ARCHITECTURE_CRITERIA and tech_lead:
+        return _weighted_score(prosecutor, defense, tech_lead, tl_weight=2)
+    return None
+
+
 def _resolve(
     dim_id: str,
     opinions: list[JudicialOpinion],
@@ -105,30 +169,24 @@ def _resolve(
     tech_lead = _get_opinion(opinions, "TechLead")
 
     # ── Rule 1: security_override ────────────────────────────────────────
-    if prosecutor and _has_security_flaw(prosecutor):
-        raw = _weighted_score(prosecutor, defense, tech_lead)
-        return min(raw, 3)
+    score = apply_rule_of_security(prosecutor, defense, tech_lead)
+    if score is not None:
+        return score
 
     # ── Rule 2: fact_supremacy ───────────────────────────────────────────
-    detective_found = _evidence_found(dim_id, evidences)
-    if detective_found is False and defense and defense.score >= 4:
-        # Detective says feature does not exist; Defense is too generous — rein it in.
-        # Use whichever is lower: Tech Lead's view or Defense-1 capped at Prosecutor.
-        tl_score = tech_lead.score if tech_lead else 3
-        adjusted_defense = max(defense.score - 2, 1)
-        adjusted = min(tl_score, adjusted_defense)
-        return max(adjusted, prosecutor.score if prosecutor else 1)
+    score = apply_rule_of_evidence(dim_id, defense, tech_lead, prosecutor, evidences)
+    if score is not None:
+        return score
 
     # ── Rule 3: functionality_weight (architecture criteria) ─────────────
-    if dim_id in _ARCHITECTURE_CRITERIA and tech_lead:
-        # Tech Lead's score is double-weighted for architecture dimensions.
-        return _weighted_score(prosecutor, defense, tech_lead, tl_weight=2)
+    score = apply_rule_of_functionality(dim_id, prosecutor, defense, tech_lead)
+    if score is not None:
+        return score
 
     # ── Rule 4 & 5: variance_re_evaluation + default weighted score ──────
     var = _variance(opinions)
     if var > 2:
-        # High disagreement — penalise by leaning toward the middle:
-        # Re-evaluate: weight Tech Lead more heavily as the pragmatic tie-breaker.
+        # High disagreement — Re-evaluate: weight Tech Lead more heavily as tie-breaker.
         return _weighted_score(prosecutor, defense, tech_lead, tl_weight=2)
 
     return _weighted_score(prosecutor, defense, tech_lead)
