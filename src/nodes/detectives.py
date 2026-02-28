@@ -293,6 +293,8 @@ def repo_investigator_node(state: AgentState) -> dict[str, Any]:
     Clones the repository once upfront, then runs one LLM agent call per dimension
     so each prompt stays small and a single dimension failure doesn't block the rest.
     """
+    if state.get("skip_detectives"):
+        return {}
     repo_url: str = state.get("repo_url", "")
     all_dimensions: list[dict] = state.get("rubric_dimensions", [])
     dimensions = [d for d in all_dimensions if d.get("target_artifact") == "github_repo"]
@@ -317,7 +319,12 @@ def repo_investigator_node(state: AgentState) -> dict[str, Any]:
         }
 
     # Clone once upfront — all dimension agents reuse the same cloned_path.
-    clone = clone_repo_sandboxed(repo_url)
+    clone_options: dict = state.get("clone_options", {})
+    clone = clone_repo_sandboxed(
+        repo_url,
+        branch=clone_options.get("branch"),
+        depth=clone_options.get("depth", 50),
+    )
     if not clone.ok:
         reason = f"Clone failed: {clone.error} — {clone.details}"
         return {
@@ -376,6 +383,8 @@ def doc_analyst_node(state: AgentState) -> dict[str, Any]:
     Runs one LLM agent call per dimension so each prompt stays small and
     a single dimension failure doesn't block the rest.
     """
+    if state.get("skip_detectives"):
+        return {}
     pdf_path: str = state.get("pdf_path", "")
     all_dimensions: list[dict] = state.get("rubric_dimensions", [])
     dimensions = [d for d in all_dimensions if d.get("target_artifact") == "pdf_report"]
@@ -443,9 +452,11 @@ def vision_inspector_node(state: AgentState) -> dict[str, Any]:
 
     Filters dimensions with target_artifact='pdf_images' from state, calls the
     diagram extraction and classification tool, then emits structured Evidence.
-    Skipped entirely (no LLM or tool calls) when VISION_ENABLED=false.
+    Skipped entirely (no LLM or tool calls) when VISION_ENABLED=false or skip_detectives=True.
     """
-    # Guard first — no tracker, logger, or LLM calls when disabled.
+    # Guard first — no tracker, logger, or LLM calls when disabled or skipped.
+    if state.get("skip_detectives"):
+        return {}
     if not _vision_enabled():
         all_dimensions: list[dict] = state.get("rubric_dimensions", [])
         dimensions = [d for d in all_dimensions if d.get("target_artifact") == "pdf_images"]

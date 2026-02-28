@@ -24,6 +24,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import ValidationError
 
 from src.state import AgentState, Evidence, JudicialOpinion
+from src.utils.spend_tracker import TRACKER
 
 load_dotenv()
 
@@ -157,6 +158,8 @@ def _invoke_judge(
         HumanMessage(content=user_content),
     ]
 
+    _callbacks = {"callbacks": [TRACKER]}
+
     last_exc: Exception | None = None
     for attempt in range(_MAX_RETRIES):
         try:
@@ -172,7 +175,7 @@ def _invoke_judge(
                         )
                     )
                 )
-            opinion: JudicialOpinion = judge_llm.invoke(retry_msgs)
+            opinion: JudicialOpinion = judge_llm.invoke(retry_msgs, config=_callbacks)
             return opinion
         except (ValidationError, Exception) as exc:
             last_exc = exc
@@ -203,6 +206,9 @@ def _judge_node(
     """
     rubric_dimensions: list[dict] = state.get("rubric_dimensions", [])
     evidence_index = _build_evidence_index(state)
+
+    node_label = f"judge:{persona.lower()}"
+    TRACKER.set_node(node_label)
 
     llm = ChatAnthropic(model=_MODEL, temperature=0)
     judge_llm = llm.with_structured_output(JudicialOpinion)
