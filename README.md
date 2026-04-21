@@ -178,40 +178,7 @@ Example stdout summary:
 
 ---
 
-## Generating PDF from Markdown
 
-Reports and docs that contain ` ```mermaid ` diagrams can be turned into a single PDF: Mermaid blocks are rendered to images with [mermaid-cli](https://github.com/mermaid-js/mermaid-cli), then [pandoc](https://pandoc.org/) produces the PDF.
-
-**Requirements:** `pandoc`, and either `mmdc` (mermaid-cli) or `npx`:
-
-```bash
-# Optional: install mermaid-cli globally (otherwise the script uses npx)
-npm install -g @mermaid-js/mermaid-cli
-```
-
-**Build PDF (default: `reports/final_report.md` → `reports/final_report.pdf`):**
-
-```bash
-make pdf
-```
-
-**Custom input/output:**
-
-```bash
-make pdf INPUT=output/audit_report_20260228_033714.md OUTPUT=output/audit.pdf
-make pdf INPUT=README.md OUTPUT=docs/readme.pdf
-```
-
-**Script only (no Makefile):**
-
-```bash
-uv run python scripts/md_to_pdf.py reports/final_report.md -o reports/final_report.pdf \
-  --metadata docs/report/templates/pdf-metadata-final.yaml
-```
-
-Options: `--build-dir`, `--image-format png|svg`, `--skip-mermaid` (only run pandoc). Run `python scripts/md_to_pdf.py --help` for details.
-
----
 
 ## Project Structure
 
@@ -232,7 +199,6 @@ src/
     └── spend_tracker.py # Token/spend tracking
 main.py                   # CLI entrypoint
 scripts/
-└── md_to_pdf.py         # Markdown → Mermaid images (mmdc) → Pandoc PDF
 Makefile                  # make pdf, check-deps, clean
 docs/
 ├── report/               # Interim/final PDF reports
